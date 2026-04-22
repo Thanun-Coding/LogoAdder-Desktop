@@ -1,10 +1,11 @@
+import multiprocessing
 import os
 import queue
 import subprocess
 import sys
 import threading
 import webbrowser
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 
 os.environ.setdefault("QT_LOGGING_RULES", "qt.text.font.db.warning=false")
@@ -18,6 +19,8 @@ from logo_core import (
     build_output_path,
     calculate_logo_size,
     calculate_position,
+    calculate_scale_anchor,
+    detect_image_orientation,
     is_supported_image,
     list_images,
     load_config,
@@ -129,7 +132,38 @@ def require_gui_dependencies():
 def open_rgba_image(path):
     if Image is None:
         raise RuntimeError("Pillow is required to process images. Install it with: pip install pillow")
-    return Image.open(path).convert("RGBA")
+    with Image.open(path) as image:
+        if image.mode == "RGBA":
+            return image.copy()
+        return image.convert("RGBA")
+
+
+PROCESS_LOGO_IMAGE = None
+
+
+def initialize_logo_worker(logo_payload):
+    global PROCESS_LOGO_IMAGE
+    if Image is None:
+        raise RuntimeError("Pillow is required to process images. Install it with: pip install pillow")
+    size, rgba_bytes = logo_payload
+    PROCESS_LOGO_IMAGE = Image.frombytes("RGBA", size, rgba_bytes)
+
+
+def process_logo_task(task):
+    if PROCESS_LOGO_IMAGE is None:
+        raise RuntimeError("Logo asset was not initialized in the worker process")
+    folder, filename, index, output_settings, conflict_policy, margin_settings, position, logo_size, opacity = task
+    input_path = Path(folder) / filename
+    output_path = build_output_path(folder, filename, output_settings, index)
+    if conflict_policy == "rename":
+        output_path = unique_output_path(output_path)
+    output_path.parent.mkdir(exist_ok=True)
+    base = open_rgba_image(input_path)
+    preview_size = contained_preview_size(base.size)
+    margins = scale_margins(margin_settings, base.size, preview_size)
+    output = compose_logo(base, PROCESS_LOGO_IMAGE, position, logo_size, opacity, margins)
+    save_output_image(output, output_path, output_settings)
+    return "success", index, filename, str(output_path)
 
 
 def contained_preview_size(image_size, bounds=PREVIEW_SIZE):
@@ -139,6 +173,32 @@ def contained_preview_size(image_size, bounds=PREVIEW_SIZE):
         return (1, 1)
     ratio = min(bound_width / width, bound_height / height, 1.0)
     return (max(1, int(round(width * ratio))), max(1, int(round(height * ratio))))
+
+
+def slider_value_from_position(x, width, minimum, maximum, inverted=False):
+    if width <= 1 or minimum >= maximum:
+        return minimum
+    ratio = core.clamp(float(x) / float(width), 0.0, 1.0)
+    if inverted:
+        ratio = 1.0 - ratio
+    return int(minimum + round(ratio * (maximum - minimum)))
+
+
+def slider_position_from_value(value, minimum, maximum, width, inverted=False):
+    if width <= 1 or minimum >= maximum:
+        return 0
+    ratio = (core.clamp(float(value), minimum, maximum) - minimum) / (maximum - minimum)
+    if inverted:
+        ratio = 1.0 - ratio
+    return int(round(ratio * width))
+
+
+def is_dialog_confirm_key(key, confirm_keys):
+    return key in confirm_keys
+
+
+def is_duplicate_preset_name(name, presets):
+    return name.strip() in presets
 
 
 def ui_font(size, bold=False):
@@ -154,6 +214,7 @@ def ui_font(size, bold=False):
 def compose_logo(base_image, logo_image, position, size_percent, opacity, margins):
     logo_width, logo_height = calculate_logo_size(
         base_image.width,
+        base_image.height,
         logo_image.width,
         logo_image.height,
         size_percent,
@@ -305,27 +366,92 @@ class MaterialComboBox(QComboBox):
 
 
 class FriendlySlider(QSlider):
+    HANDLE_GRAB_WIDTH = 32
+
     def __init__(self, orientation, parent=None):
         super().__init__(orientation, parent)
         self.setTracking(True)
         self.setFocusPolicy(Qt.NoFocus)
         self.setCursor(Qt.PointingHandCursor)
-        self.setFixedHeight(28)
+        self.setFixedHeight(34)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAutoFillBackground(False)
+        self.drag_offset = 0.0
+
+    def usable_width(self):
+        return max(1, self.width() - 1)
+
+    def handle_center_x(self):
+        return slider_position_from_value(
+            self.value(),
+            self.minimum(),
+            self.maximum(),
+            self.usable_width(),
+            self.invertedAppearance(),
+        )
+
+    def is_on_handle(self, x):
+        half_width = self.HANDLE_GRAB_WIDTH / 2
+        return abs(float(x) - self.handle_center_x()) <= half_width
+
+    def set_value_from_event(self, event, use_drag_offset=False):
+        x = event.position().x()
+        if use_drag_offset:
+            x -= self.drag_offset
+        value = slider_value_from_position(
+            x,
+            self.usable_width(),
+            self.minimum(),
+            self.maximum(),
+            self.invertedAppearance(),
+        )
+        self.setValue(value)
 
     def mousePressEvent(self, event):
         if self.orientation() != Qt.Horizontal or self.width() <= 0:
             return super().mousePressEvent(event)
-        ratio = core.clamp(event.position().x() / max(1, self.width()), 0.0, 1.0)
-        if self.invertedAppearance():
-            ratio = 1.0 - ratio
-        value = self.minimum() + round(ratio * (self.maximum() - self.minimum()))
-        self.setValue(value)
+        if event.button() == Qt.LeftButton:
+            self.setSliderDown(True)
+            if self.is_on_handle(event.position().x()):
+                self.drag_offset = event.position().x() - self.handle_center_x()
+            else:
+                self.drag_offset = 0.0
+                self.set_value_from_event(event)
+            event.accept()
+            return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.orientation() == Qt.Horizontal and self.isSliderDown() and event.buttons() & Qt.LeftButton:
+            self.set_value_from_event(event, use_drag_offset=True)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self.orientation() == Qt.Horizontal and event.button() == Qt.LeftButton:
+            self.set_value_from_event(event, use_drag_offset=True)
+            self.setSliderDown(False)
+            self.drag_offset = 0.0
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event):
         event.ignore()
+
+
+class ShortcutConfirmDialog(QDialog):
+    def __init__(self, confirm_keys=None, parent=None):
+        super().__init__(parent)
+        self.confirm_keys = set(confirm_keys or ())
+
+    def keyPressEvent(self, event):
+        if is_dialog_confirm_key(event.key(), self.confirm_keys):
+            self.accept()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 class LiveHeader(QWidget):
@@ -445,10 +571,10 @@ class DropOverlay(QWidget):
         painter.drawRoundedRect(card, 28, 28)
         painter.setPen(QColor(THEME["cyan"]))
         painter.setFont(make_font(29, bold=True))
-        painter.drawText(card.adjusted(0, 40, 0, -90), Qt.AlignCenter, "DROP PHOTOS HERE")
+        painter.drawText(card.adjusted(0, 40, 0, -90), Qt.AlignCenter, "ទម្លាក់រូបភាពនៅទីនេះ")
         painter.setPen(QColor(THEME["text"]))
         painter.setFont(make_font(15, bold=True))
-        painter.drawText(card.adjusted(0, 110, 0, -35), Qt.AlignCenter, "Drop a folder or photo file to choose images for editing")
+        painter.drawText(card.adjusted(0, 110, 0, -35), Qt.AlignCenter, "ទម្លាក់Folderរូបភាព ឬ រូបភាព ដើម្បីជ្រើសរើសរូបភាពសម្រាប់កែប្រែ")
 
 
 class LogoAdderUltra(QMainWindow):
@@ -564,8 +690,8 @@ class LogoAdderUltra(QMainWindow):
     def populate_sidebar(self):
         self.add_section("រូបភាព")
         source_row = QHBoxLayout()
-        self.btn_browse_photos = self.create_button("Browse Photo", self.browse_photos)
-        self.btn_browse_folder = self.create_button("Browse Folder", self.browse_folder)
+        self.btn_browse_photos = self.create_button("ជ្រើសរើស Photo", self.browse_photos)
+        self.btn_browse_folder = self.create_button("ជ្រើសរើស Folder", self.browse_folder)
         source_row.addWidget(self.btn_browse_photos)
         source_row.addWidget(self.btn_browse_folder)
         self.sidebar_layout.addLayout(source_row)
@@ -589,7 +715,7 @@ class LogoAdderUltra(QMainWindow):
         preset_row.addWidget(self.btn_delete_preset)
         self.sidebar_layout.addLayout(preset_row)
 
-        self.create_input_group("ទំហំ Logo (%)", "logo_size", 5, 100, self.config["logo_size"])
+        self.create_input_group("ទំហំ Logo (%)", "logo_size", 1, 100, self.config["logo_size"])
         self.create_input_group("កម្រិតច្បាស់ Logo (%)", "opacity", 0, 100, self.config["opacity"])
 
         self.add_section("ទីតាំង Logo")
@@ -881,7 +1007,7 @@ class LogoAdderUltra(QMainWindow):
         self.config["selected_preset"] = name
         self.persist_presets()
         self.pos_menu.setCurrentText(normalize_position(preset.get("position")))
-        self.set_input_value("logo_size", int(preset.get("logo_size", 10)))
+        self.set_input_value("logo_size", int(preset.get("logo_size", 5)))
         self.set_input_value("opacity", int(float(preset.get("opacity", 1.0)) * 100))
         for key in ("m_top", "m_bottom", "m_left", "m_right"):
             self.set_input_value(key, int(preset.get(key, 10)))
@@ -951,6 +1077,16 @@ class LogoAdderUltra(QMainWindow):
                 name_entry.setProperty("error", True)
                 self.refresh_style(name_entry)
                 return
+            if is_duplicate_preset_name(name, self.config.get("presets", {})):
+                choice = self.duplicate_preset_dialog(name)
+                if choice == "rename":
+                    name_entry.setProperty("error", True)
+                    self.refresh_style(name_entry)
+                    name_entry.setFocus()
+                    name_entry.selectAll()
+                    return
+                if choice != "overwrite":
+                    return
             self.config["presets"][name] = preset_from_settings(self.current_config())
             self.refresh_preset_menu()
             self.preset_menu.setCurrentText(name)
@@ -965,6 +1101,56 @@ class LogoAdderUltra(QMainWindow):
             self.refresh_style(button)
         name_entry.returnPressed.connect(save_preset)
         dialog.exec()
+
+    def duplicate_preset_dialog(self, name):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Preset មានរួចហើយ")
+        dialog.setObjectName("materialDialog")
+        dialog.setFixedSize(410, 180)
+        icon_path = resource_path("myicon.ico")
+        if icon_path.exists():
+            dialog.setWindowIcon(QIcon(str(icon_path)))
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(7)
+        title = QLabel("Preset មានរួចហើយ")
+        title.setObjectName("dialogTitle")
+        title.setAlignment(Qt.AlignCenter)
+        body = QLabel(f"Preset '{name}' មានរួចហើយ។ ប្ដូរឈ្មោះ ឬរក្សាទុកលើឈ្មោះនេះ?")
+        body.setObjectName("hintLabel")
+        body.setWordWrap(True)
+        body.setAlignment(Qt.AlignCenter)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        overwrite_btn = QPushButton("រក្សាទុកលើឈ្មោះនេះ")
+        overwrite_btn.setProperty("variant", "success")
+        overwrite_btn.setProperty("dialogButton", True)
+        overwrite_btn.setCursor(Qt.PointingHandCursor)
+        overwrite_btn.setFocusPolicy(Qt.NoFocus)
+        rename_btn = QPushButton("ប្ដូរឈ្មោះ")
+        rename_btn.setProperty("variant", "danger")
+        rename_btn.setProperty("dialogButton", True)
+        rename_btn.setCursor(Qt.PointingHandCursor)
+        rename_btn.setFocusPolicy(Qt.NoFocus)
+
+        choice = {"value": ""}
+
+        def choose(value):
+            choice["value"] = value
+            dialog.accept()
+
+        overwrite_btn.clicked.connect(lambda: choose("overwrite"))
+        rename_btn.clicked.connect(lambda: choose("rename"))
+        row.addWidget(overwrite_btn, 2)
+        row.addWidget(rename_btn, 1)
+
+        layout.addWidget(title)
+        layout.addWidget(body)
+        layout.addLayout(row)
+        dialog.exec()
+        return choice["value"]
 
     def themed_message_dialog(self, title_text, body_text, confirm_text="យល់ព្រម", danger=False):
         dialog = QDialog(self)
@@ -997,8 +1183,8 @@ class LogoAdderUltra(QMainWindow):
         layout.addWidget(button)
         dialog.exec()
 
-    def confirm_dialog(self, title_text, body_text, confirm_text="លុប", cancel_text="បិទ"):
-        dialog = QDialog(self)
+    def confirm_dialog(self, title_text, body_text, confirm_text="លុប", cancel_text="បិទ", confirm_keys=None):
+        dialog = ShortcutConfirmDialog(confirm_keys=confirm_keys, parent=self)
         dialog.setWindowTitle(title_text)
         dialog.setObjectName("materialDialog")
         dialog.setFixedSize(360, 165)
@@ -1043,7 +1229,7 @@ class LogoAdderUltra(QMainWindow):
         name = self.preset_menu.currentText()
         if name not in self.config.get("presets", {}):
             return
-        if not self.confirm_dialog("លុប Preset", f"លុប Preset '{name}' មែនទេ?", confirm_text="លុប", cancel_text="បិទ"):
+        if not self.confirm_dialog("លុប Preset", f"លុប Preset '{name}' មែនទេ?", confirm_text="លុប", cancel_text="បិទ", confirm_keys={Qt.Key_Space}):
             return
         del self.config["presets"][name]
         self.refresh_preset_menu()
@@ -1418,33 +1604,21 @@ class LogoAdderUltra(QMainWindow):
         except Exception as error:
             self.processing_queue.put(("fatal", f"មិនអាចបើក Logo បានទេ: {error}"))
             return
-
-        def process_one(index, filename):
-            if self.cancel_requested.is_set():
-                return "cancelled", index, filename, None
-            input_path = Path(folder) / filename
-            output_path = build_output_path(folder, filename, output_settings, index)
-            if conflict_policy == "rename":
-                output_path = unique_output_path(output_path)
-            base = open_rgba_image(input_path)
-            preview_size = contained_preview_size(base.size)
-            margins = scale_margins(margin_settings, base.size, preview_size)
-            output = compose_logo(base, logo, settings["position"], settings["logo_size"], settings["opacity"], margins)
-            save_output_image(output, output_path, output_settings)
-            return "success", index, filename, None
+        logo_payload = (logo.size, logo.tobytes("raw", "RGBA"))
 
         total = len(files)
         completed = 0
         next_index = 0
         pending = {}
-        max_workers = min(4, max(1, os.cpu_count() or 1), total)
-        executor = ThreadPoolExecutor(max_workers=max_workers)
+        max_workers = min(max(1, os.cpu_count() or 1), total)
+        executor = ProcessPoolExecutor(max_workers=max_workers, initializer=initialize_logo_worker, initargs=(logo_payload,))
         try:
             while (next_index < total or pending) and not self.cancel_requested.is_set():
                 while next_index < total and len(pending) < max_workers and not self.cancel_requested.is_set():
                     file_index = next_index + 1
                     filename = files[next_index]
-                    pending[executor.submit(process_one, file_index, filename)] = filename
+                    task = (folder, filename, file_index, output_settings, conflict_policy, margin_settings, settings["position"], settings["logo_size"], settings["opacity"])
+                    pending[executor.submit(process_logo_task, task)] = filename
                     next_index += 1
                 if not pending:
                     break
@@ -1763,10 +1937,10 @@ def material_qss():
     QSlider::handle:horizontal {{
         background: #47dcff;
         border: 3px solid {THEME["sidebar"]};
-        width: 18px;
-        height: 18px;
-        margin: -7px 0;
-        border-radius: 9px;
+        width: 24px;
+        height: 24px;
+        margin: -10px -12px;
+        border-radius: 12px;
     }}
     QSlider::handle:horizontal:hover {{
         background: {THEME["cyan"]};
@@ -1938,6 +2112,7 @@ def material_qss():
 
 
 def main():
+    multiprocessing.freeze_support()
     try:
         require_gui_dependencies()
     except RuntimeError as error:

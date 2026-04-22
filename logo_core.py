@@ -29,7 +29,7 @@ DEFAULT_OUTPUT_SETTINGS = {
 DEFAULT_CONFIG = {
     "opacity": 1.0,
     "position": DEFAULT_POSITION,
-    "logo_size": 10,
+    "logo_size": 5,
     "logo_path": "",
     "folder_path": "",
     "m_top": 10,
@@ -85,14 +85,32 @@ def clamp(value, minimum, maximum):
     return max(minimum, min(maximum, value))
 
 
-def calculate_logo_size(image_width, logo_width, logo_height, size_percent):
-    if image_width <= 0:
-        raise ValueError("image_width must be greater than zero")
+def detect_image_orientation(image_width, image_height):
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError("image dimensions must be greater than zero")
+    if image_width > image_height:
+        return "landscape"
+    if image_height > image_width:
+        return "portrait"
+    return "square"
+
+
+def calculate_scale_anchor(image_width, image_height):
+    orientation = detect_image_orientation(image_width, image_height)
+    if orientation == "landscape":
+        return image_width
+    if orientation == "portrait":
+        return image_height
+    return image_width
+
+
+def calculate_logo_size(image_width, image_height, logo_width, logo_height, size_percent):
+    anchor = calculate_scale_anchor(image_width, image_height)
     if logo_width <= 0 or logo_height <= 0:
         raise ValueError("logo dimensions must be greater than zero")
 
     percent = clamp(float(size_percent), 1.0, 100.0)
-    width = max(1, int(round(image_width * (percent / 100))))
+    width = max(1, int(round(anchor * (percent / 100))))
     height = max(1, int(round(logo_height * (width / logo_width))))
     return width, height
 
@@ -223,7 +241,7 @@ def preset_from_settings(settings):
     return {
         "logo_path": str(settings.get("logo_path", "")),
         "position": normalize_position(settings.get("position")),
-        "logo_size": int(clamp(float(settings.get("logo_size", 10)), 1, 100)),
+        "logo_size": int(clamp(float(settings.get("logo_size", 5)), 1, 100)),
         "opacity": clamp(float(settings.get("opacity", 1.0)), 0.0, 1.0),
         "m_top": int(clamp(float(settings.get("m_top", 10)), 0, 500)),
         "m_bottom": int(clamp(float(settings.get("m_bottom", 10)), 0, 500)),
