@@ -22,6 +22,7 @@ from logo_core import (
     DEFAULT_OUTPUT_SETTINGS,
     build_error_summary,
     build_output_path,
+    normalize_selected_image_paths,
     normalize_output_settings,
     preset_from_settings,
     unique_output_path,
@@ -193,6 +194,27 @@ class LogoHelperTests(unittest.TestCase):
 
         self.assertIn("a.jpg - bad file", summary)
         self.assertIn("b.png - locked", summary)
+
+    def test_normalize_selected_image_paths_keeps_only_dropped_files(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            same_parent = root / "inputs"
+            other_parent = root / "other"
+            same_parent.mkdir()
+            other_parent.mkdir()
+
+            kept_a = same_parent / "a.png"
+            kept_b = same_parent / "b.jpg"
+            ignored_text = same_parent / "note.txt"
+            ignored_other_parent = other_parent / "c.png"
+
+            for path in (kept_a, kept_b, ignored_other_parent):
+                path.write_bytes(b"img")
+            ignored_text.write_text("x", encoding="utf-8")
+
+            result = normalize_selected_image_paths([kept_a, ignored_text, kept_b, ignored_other_parent, kept_a])
+
+            self.assertEqual(result, [kept_a, kept_b])
 
 
 if __name__ == "__main__":

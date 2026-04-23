@@ -26,6 +26,7 @@ from logo_core import (
     load_config,
     normalize_output_settings,
     normalize_position,
+    normalize_selected_image_paths,
     preset_from_settings,
     resource_path,
     save_config,
@@ -931,14 +932,15 @@ class LogoAdderUltra(QMainWindow):
         urls = event.mimeData().urls()
         if not urls:
             return
-        path = Path(urls[0].toLocalFile())
-        if path.is_dir():
-            self.set_folder(path)
-        elif is_supported_image(path.name):
-            self.set_folder(path.parent)
-            if path.name in self.image_list:
-                self.current_preview_index = self.image_list.index(path.name)
-                self.update_live_preview()
+        paths = [Path(url.toLocalFile()) for url in urls if url.toLocalFile()]
+        image_paths = normalize_selected_image_paths(paths)
+        if image_paths:
+            self.set_photo_files(image_paths)
+            return
+
+        folder_paths = [path for path in paths if path.is_dir()]
+        if folder_paths:
+            self.set_folder(folder_paths[0])
         else:
             self.themed_message_dialog("ឯកសារមិនគាំទ្រ", "ទម្លាក់Folderរូបភាព ឬរូបភាពដើម្បីកែ! ជ្រើសរើស Logo ដោយប្រើប៊ូតុងជ្រើសរើស Logo។")
 
@@ -1313,13 +1315,12 @@ class LogoAdderUltra(QMainWindow):
         self.update_live_preview()
 
     def set_photo_files(self, paths):
-        image_paths = [path for path in paths if is_supported_image(path.name)]
+        image_paths = normalize_selected_image_paths(paths)
         if not image_paths:
             self.themed_message_dialog("រកមិនឃើញរូបភាព", "មិនមានរូបភាពដែលគាំទ្រសម្រាប់បើកទេ។")
             return
-        parent = image_paths[0].parent
-        image_paths = [path for path in image_paths if path.parent == parent]
         self.image_list = [path.name for path in image_paths]
+        parent = image_paths[0].parent
         self.config["folder_path"] = str(parent)
         self.folder_path_lbl.setText(f"{len(self.image_list)} រូបភាពពី {self.truncate_path(parent)}")
         self.current_preview_index = 0

@@ -164,6 +164,25 @@ def list_images(folder):
         return []
 
 
+def normalize_selected_image_paths(paths):
+    normalized = []
+    seen = set()
+
+    for raw_path in paths:
+        path = Path(raw_path)
+        if path.is_file() and is_supported_image(path.name):
+            resolved = path.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                normalized.append(path)
+
+    if not normalized:
+        return []
+
+    parent = normalized[0].parent
+    return [path for path in normalized if path.parent == parent]
+
+
 def normalize_output_settings(settings):
     settings = settings if isinstance(settings, dict) else {}
     output_format = settings.get("format", DEFAULT_OUTPUT_SETTINGS["format"])
