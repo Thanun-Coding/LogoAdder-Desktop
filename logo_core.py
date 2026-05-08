@@ -1,13 +1,29 @@
 import ctypes
 import json
 import os
+import re
 import sys
 from pathlib import Path
+
+try:
+    from PIL import Image, ImageOps
+except ModuleNotFoundError:
+    Image = None
+    ImageOps = None
 
 
 SUPPORTED_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif")
 ALPHA_EXTENSIONS = (".png", ".webp")
 OUTPUT_FORMATS = ("Same as source", "PNG", "JPG", "WebP")
+PREVIEW_SIZE = (840, 500)
+WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
 
 KHMER_POSITIONS = {
     "top_left": "លើ-ឆ្វេង",
@@ -48,12 +64,31 @@ def application_dir():
     return Path(__file__).resolve().parent
 
 
-CONFIG_FILE = application_dir() / "config.json"
+def config_dir():
+    if os.name == "nt":
+        app_data = os.environ.get("APPDATA")
+        if app_data:
+            return Path(app_data) / "LogoAdder"
+    return application_dir()
+
+
+CONFIG_FILE = config_dir() / "config.json"
+LAST_CONFIG_ERROR = ""
 
 
 def resource_path(relative_path):
     base_path = Path(getattr(sys, "_MEIPASS", application_dir()))
-    return base_path / relative_path
+    direct_path = base_path / relative_path
+    if direct_path.exists():
+        return direct_path
+    asset_path = base_path / "assets" / relative_path
+    if asset_path.exists():
+        return asset_path
+    return direct_path
+
+
+def get_config_error():
+    return LAST_CONFIG_ERROR
 
 
 def set_hidden_attribute(path, hidden=True):
@@ -83,6 +118,20 @@ def should_preserve_alpha(filename):
 
 def clamp(value, minimum, maximum):
     return max(minimum, min(maximum, value))
+
+
+def require_pillow():
+    if Image is None:
+        raise RuntimeError("Pillow is required to process images. Install it with: pip install pillow")
+
+
+def open_rgba_image(path):
+    require_pillow()
+    with Image.open(path) as image:
+        image = ImageOps.exif_transpose(image)
+        if image.mode == "RGBA":
+            return image.copy()
+        return image.convert("RGBA")
 
 
 def detect_image_orientation(image_width, image_height):
@@ -157,6 +206,41 @@ def scale_margins(margins, original_size, preview_size):
     }
 
 
+def contained_preview_size(image_size, bounds=PREVIEW_SIZE):
+    width, height = image_size
+    bound_width, bound_height = bounds
+    if width <= 0 or height <= 0:
+        return (1, 1)
+    ratio = min(bound_width / width, bound_height / height, 1.0)
+    return (max(1, int(round(width * ratio))), max(1, int(round(height * ratio))))
+
+
+def slider_value_from_position(x, width, minimum, maximum, inverted=False):
+    if width <= 1 or minimum >= maximum:
+        return minimum
+    ratio = clamp(float(x) / float(width), 0.0, 1.0)
+    if inverted:
+        ratio = 1.0 - ratio
+    return int(minimum + round(ratio * (maximum - minimum)))
+
+
+def slider_position_from_value(value, minimum, maximum, width, inverted=False):
+    if width <= 1 or minimum >= maximum:
+        return 0
+    ratio = (clamp(float(value), minimum, maximum) - minimum) / (maximum - minimum)
+    if inverted:
+        ratio = 1.0 - ratio
+    return int(round(ratio * width))
+
+
+def is_dialog_confirm_key(key, confirm_keys):
+    return key in confirm_keys
+
+
+def is_duplicate_preset_name(name, presets):
+    return name.strip() in presets
+
+
 def list_images(folder):
     try:
         return sorted(f for f in os.listdir(folder) if is_supported_image(f))
@@ -203,9 +287,22 @@ def normalize_output_settings(settings):
     return {
         "format": output_format,
         "quality": int(clamp(quality, 1, 100)),
-        "name_prefix": name_prefix or DEFAULT_OUTPUT_SETTINGS["name_prefix"],
-        "folder_name": folder_name or DEFAULT_OUTPUT_SETTINGS["folder_name"],
+        "name_prefix": sanitize_path_part(name_prefix, DEFAULT_OUTPUT_SETTINGS["name_prefix"]),
+        "folder_name": sanitize_path_part(folder_name, DEFAULT_OUTPUT_SETTINGS["folder_name"]),
     }
+
+
+def sanitize_path_part(value, default, max_length=80):
+    text = str(value or "").strip()
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "-", text)
+    text = re.sub(r"\s+", " ", text).strip(" .")
+    if not text or text in {".", ".."}:
+        text = default
+    if text.upper() in WINDOWS_RESERVED_NAMES:
+        text = f"{text}-file"
+    if len(text) > max_length:
+        text = text[:max_length].rstrip(" .")
+    return text or default
 
 
 def extension_for_format(original_extension, output_format):
@@ -240,6 +337,7 @@ def unique_output_path(output_path):
 
 
 def save_output_image(image, output_path, output_settings=None):
+    require_pillow()
     output_path = Path(output_path)
     settings = normalize_output_settings(output_settings)
     save_kwargs = {}
@@ -253,6 +351,51 @@ def save_output_image(image, output_path, output_settings=None):
     elif not should_preserve_alpha(output_path.name):
         image = image.convert("RGB")
     image.save(output_path, **save_kwargs)
+
+
+PROCESS_LOGO_IMAGE = None
+
+
+def initialize_logo_worker(logo_payload):
+    global PROCESS_LOGO_IMAGE
+    require_pillow()
+    size, rgba_bytes = logo_payload
+    PROCESS_LOGO_IMAGE = Image.frombytes("RGBA", size, rgba_bytes)
+
+
+def compose_logo(base_image, logo_image, position, size_percent, opacity, margins):
+    logo_width, logo_height = calculate_logo_size(
+        base_image.width,
+        base_image.height,
+        logo_image.width,
+        logo_image.height,
+        size_percent,
+    )
+    resized_logo = logo_image.resize((logo_width, logo_height), Image.LANCZOS)
+    alpha = resized_logo.split()[3].point(lambda p: int(p * clamp(float(opacity), 0.0, 1.0)))
+    resized_logo.putalpha(alpha)
+
+    x, y = calculate_position(base_image.size, resized_logo.size, position, margins)
+    output = base_image.copy()
+    output.paste(resized_logo, (x, y), resized_logo)
+    return output
+
+
+def process_logo_task(task):
+    if PROCESS_LOGO_IMAGE is None:
+        raise RuntimeError("Logo asset was not initialized in the worker process")
+    folder, filename, index, output_settings, conflict_policy, margin_settings, position, logo_size, opacity = task
+    input_path = Path(folder) / filename
+    output_path = build_output_path(folder, filename, output_settings, index)
+    if conflict_policy == "rename":
+        output_path = unique_output_path(output_path)
+    output_path.parent.mkdir(exist_ok=True)
+    base = open_rgba_image(input_path)
+    preview_size = contained_preview_size(base.size)
+    margins = scale_margins(margin_settings, base.size, preview_size)
+    output = compose_logo(base, PROCESS_LOGO_IMAGE, position, logo_size, opacity, margins)
+    save_output_image(output, output_path, output_settings)
+    return "success", index, filename, str(output_path)
 
 
 def preset_from_settings(settings):
@@ -277,6 +420,8 @@ def normalize_presets(presets):
 
 
 def load_config():
+    global LAST_CONFIG_ERROR
+    LAST_CONFIG_ERROR = ""
     config = DEFAULT_CONFIG.copy()
     config["output"] = DEFAULT_OUTPUT_SETTINGS.copy()
     config["presets"] = {}
@@ -286,8 +431,8 @@ def load_config():
                 loaded = json.load(file)
             if isinstance(loaded, dict):
                 config.update(loaded)
-        except (OSError, json.JSONDecodeError):
-            pass
+        except (OSError, json.JSONDecodeError) as error:
+            LAST_CONFIG_ERROR = f"Could not load config from {CONFIG_FILE}: {error}"
 
     config["position"] = normalize_position(config.get("position"))
     config["output"] = normalize_output_settings(config.get("output"))
@@ -296,13 +441,18 @@ def load_config():
 
 
 def save_config(data):
+    global LAST_CONFIG_ERROR
+    LAST_CONFIG_ERROR = ""
     try:
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
         set_hidden_attribute(CONFIG_FILE, hidden=False)
         with CONFIG_FILE.open("w", encoding="utf-8") as file:
             json.dump(data, file, ensure_ascii=False, indent=2)
         set_hidden_attribute(CONFIG_FILE, hidden=True)
-    except OSError:
-        pass
+        return True
+    except OSError as error:
+        LAST_CONFIG_ERROR = f"Could not save config to {CONFIG_FILE}: {error}"
+        return False
 
 
 def build_error_summary(errors):

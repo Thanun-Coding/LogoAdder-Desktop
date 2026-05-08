@@ -5,12 +5,12 @@ a = Analysis(
     ['LogoAdder.py'],
     pathex=[],
     binaries=[],
-    datas=[('myicon.ico', '.'), ('Title Logo.png', '.')],
-    hiddenimports=['PySide6', 'qt_material', 'PIL._tkinter_finder'],
+    datas=[('assets\\myicon.ico', 'assets'), ('assets\\Title Logo.png', 'assets'), ('assets\\KhmerOSmuollight.ttf', 'assets'), ('assets\\KhmerOSsiemreap.ttf', 'assets')],
+    hiddenimports=['PySide6'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['PyQt6', 'PyQt5', 'PySide2'],
+    excludes=['qt_material', 'PyQt6', 'PyQt5', 'PySide2', 'tkinter', 'numpy'],
     noarchive=False,
     optimize=0,
 )
@@ -35,5 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['myicon.ico'],
+    icon=['assets\\myicon.ico'],
 )

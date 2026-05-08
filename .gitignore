@@ -1,15 +1,25 @@
 __pycache__/
 *.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 build/
 dist/
 Outputs/
+tests/Outputs/
+*.spec.bak
 
 config.json
 
 .venv/
 venv/
 env/
+.env
 
 *.log
 *.tmp
+failed_files.txt

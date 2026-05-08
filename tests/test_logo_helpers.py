@@ -2,29 +2,33 @@ import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
-from LogoAdder import (
+import logo_core
+from logo_core import (
+    DEFAULT_OUTPUT_SETTINGS,
     KHMER_POSITIONS,
+    build_error_summary,
+    build_output_path,
     calculate_logo_size,
     calculate_position,
     calculate_scale_anchor,
-    detect_image_orientation,
-    is_supported_image,
-    should_preserve_alpha,
     contained_preview_size,
-    is_dialog_confirm_key,
+    detect_image_orientation,
     is_duplicate_preset_name,
+    is_dialog_confirm_key,
+    is_supported_image,
     initialize_logo_worker,
+    normalize_output_settings,
+    normalize_selected_image_paths,
+    preset_from_settings,
+    open_rgba_image,
     process_logo_task,
+    sanitize_path_part,
+    save_config,
+    save_output_image,
+    load_config,
+    should_preserve_alpha,
     slider_position_from_value,
     slider_value_from_position,
-)
-from logo_core import (
-    DEFAULT_OUTPUT_SETTINGS,
-    build_error_summary,
-    build_output_path,
-    normalize_selected_image_paths,
-    normalize_output_settings,
-    preset_from_settings,
     unique_output_path,
 )
 
@@ -111,6 +115,20 @@ class LogoHelperTests(unittest.TestCase):
         self.assertFalse(should_preserve_alpha("watermark.jpg"))
         self.assertFalse(should_preserve_alpha("watermark.jpeg"))
 
+    def test_open_rgba_image_applies_exif_orientation(self):
+        with TemporaryDirectory() as temp_dir:
+            from PIL import Image
+
+            path = Path(temp_dir) / "rotated.jpg"
+            image = Image.new("RGB", (80, 40), "white")
+            exif = image.getexif()
+            exif[274] = 6
+            image.save(path, exif=exif)
+
+            result = open_rgba_image(path)
+
+            self.assertEqual(result.size, (40, 80))
+
     def test_output_path_uses_suffix_and_selected_format(self):
         settings = normalize_output_settings({"format": "PNG", "name_prefix": "EOA", "folder_name": "Export"})
 
@@ -158,6 +176,31 @@ class LogoHelperTests(unittest.TestCase):
 
         self.assertEqual(str(result).replace("\\", "/"), "C:/Images/Outputs/EOA-3.JPEG")
 
+    def test_save_output_image_converts_jpg_to_rgb(self):
+        with TemporaryDirectory() as temp_dir:
+            from PIL import Image
+
+            output_path = Path(temp_dir) / "photo.jpg"
+            image = Image.new("RGBA", (8, 8), (255, 0, 0, 120))
+
+            save_output_image(image, output_path, {"format": "JPG", "quality": 90})
+
+            with Image.open(output_path) as saved:
+                self.assertEqual(saved.mode, "RGB")
+
+    def test_save_output_image_preserves_png_alpha(self):
+        with TemporaryDirectory() as temp_dir:
+            from PIL import Image
+
+            output_path = Path(temp_dir) / "photo.png"
+            image = Image.new("RGBA", (8, 8), (255, 0, 0, 120))
+
+            save_output_image(image, output_path, {"format": "PNG"})
+
+            with Image.open(output_path) as saved:
+                self.assertEqual(saved.mode, "RGBA")
+                self.assertEqual(saved.getpixel((0, 0))[3], 120)
+
     def test_output_settings_are_clamped_and_defaulted(self):
         settings = normalize_output_settings({"format": "bad", "quality": 500, "name_prefix": "", "folder_name": ""})
 
@@ -165,6 +208,21 @@ class LogoHelperTests(unittest.TestCase):
         self.assertEqual(settings["quality"], 100)
         self.assertEqual(settings["name_prefix"], "EOA")
         self.assertEqual(settings["folder_name"], "Outputs")
+
+    def test_output_settings_sanitize_path_parts(self):
+        settings = normalize_output_settings(
+            {
+                "name_prefix": "../bad:name*",
+                "folder_name": r"..\outside/CON",
+            }
+        )
+
+        self.assertEqual(settings["name_prefix"], "-bad-name-")
+        self.assertEqual(settings["folder_name"], "-outside-CON")
+
+    def test_sanitize_path_part_uses_default_for_empty_or_parent_path(self):
+        self.assertEqual(sanitize_path_part("..", "Outputs"), "Outputs")
+        self.assertEqual(sanitize_path_part("   ", "EOA"), "EOA")
 
     def test_preset_from_settings_captures_user_options(self):
         preset = preset_from_settings(
@@ -188,6 +246,36 @@ class LogoHelperTests(unittest.TestCase):
         self.assertEqual(preset["output"]["format"], "WebP")
         self.assertEqual(preset["output"]["quality"], 88)
         self.assertEqual(preset["output"]["name_prefix"], "EOA")
+
+    def test_config_save_load_round_trip_uses_config_file(self):
+        with TemporaryDirectory() as temp_dir:
+            original_config_file = logo_core.CONFIG_FILE
+            logo_core.CONFIG_FILE = Path(temp_dir) / "config.json"
+            try:
+                saved = save_config(
+                    {
+                        "logo_path": "C:/logo.png",
+                        "position": KHMER_POSITIONS["center"],
+                        "logo_size": 20,
+                        "opacity": 0.5,
+                        "m_top": 1,
+                        "m_bottom": 2,
+                        "m_left": 3,
+                        "m_right": 4,
+                        "output": {"format": "PNG", "quality": 90, "name_prefix": "EOA", "folder_name": "Ready"},
+                        "presets": {},
+                        "selected_preset": "",
+                    }
+                )
+
+                loaded = load_config()
+            finally:
+                logo_core.CONFIG_FILE = original_config_file
+
+            self.assertTrue(saved)
+            self.assertEqual(loaded["position"], KHMER_POSITIONS["center"])
+            self.assertEqual(loaded["output"]["format"], "PNG")
+            self.assertEqual(loaded["output"]["folder_name"], "Ready")
 
     def test_error_summary_lists_failed_files(self):
         summary = build_error_summary([{"file": "a.jpg", "error": "bad file"}, {"file": "b.png", "error": "locked"}])
