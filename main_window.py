@@ -681,6 +681,11 @@ class LogoAdderUltra(QMainWindow):
         auto_btn = QPushButton("Auto")
         reset_btn.setProperty("variant", "danger")
         auto_btn.setProperty("variant", "primary")
+        auto_btn.setToolTip(
+            "កែសម្រួលរូបភាពដោយស្វ័យប្រវត្តិ\n"
+            "ចុចធម្មតា៖ កែតែរូបដែលកំពុងមើល\n"
+            "សង្កត់ Shift + ចុច៖ កែរូបភាពទាំងអស់"
+        )
         for button in (reset_btn, auto_btn):
             button.setCursor(Qt.PointingHandCursor)
             button.setFocusPolicy(Qt.NoFocus)
@@ -777,14 +782,16 @@ class LogoAdderUltra(QMainWindow):
         self.save_target_adjustments(settings)
 
     def enable_auto_adjustment(self):
+        if QApplication.keyboardModifiers() & Qt.ShiftModifier:
+            self.enable_auto_adjustment_for_all()
+            return
         key = self.current_photo_key()
         folder_path = self.config.get("folder_path")
         if not key or not folder_path:
             self.update_adjustment_status("សូមជ្រើសរើសរូបភាពមុនពេលប្រើ Auto")
             return
         try:
-            image = open_rgba_image(Path(folder_path) / key)
-            settings = estimate_auto_adjustments(image)
+            settings = self.estimate_auto_adjustment_for_photo(Path(folder_path), key)
         except (OSError, ValueError, RuntimeError) as error:
             self.update_adjustment_status(f"Auto មិនអាចដំណើរការ: {error}")
             return
@@ -793,8 +800,41 @@ class LogoAdderUltra(QMainWindow):
         self.on_slider_move()
         self.load_adjustment_dialog_values()
 
+    def estimate_auto_adjustment_for_photo(self, folder_path, filename):
+        image = open_rgba_image(Path(folder_path) / filename)
+        return estimate_auto_adjustments(image)
+
+    def enable_auto_adjustment_for_all(self):
+        folder_path = self.config.get("folder_path")
+        files = self.image_list or (list_images(folder_path) if folder_path else [])
+        if not folder_path or not files:
+            self.update_adjustment_status("សូមជ្រើសរើសរូបភាពមុនពេលប្រើ Shift + Auto")
+            return
+        root = Path(folder_path)
+        failed = 0
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            for filename in files:
+                try:
+                    self.photo_adjustments[filename] = self.estimate_auto_adjustment_for_photo(root, filename)
+                except (OSError, ValueError, RuntimeError):
+                    failed += 1
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.on_slider_move()
+        self.load_adjustment_dialog_values()
+        total = len(files)
+        if failed:
+            self.update_adjustment_status(f"Auto បានអនុវត្តទៅ {to_khmer_digits(total - failed)} / {to_khmer_digits(total)} រូប")
+        else:
+            self.update_adjustment_status(f"Auto បានអនុវត្តទៅរូបភាពទាំងអស់ {to_khmer_digits(total)} រូប")
+
     def reset_adjustments(self):
-        self.save_target_adjustments(ADJUSTMENT_DEFAULTS.copy())
+        current = self.target_adjustments()
+        reset = ADJUSTMENT_DEFAULTS.copy()
+        for key in ("rotation", "flip_horizontal", "flip_vertical"):
+            reset[key] = current.get(key, reset[key])
+        self.save_target_adjustments(reset)
         self.load_adjustment_dialog_values()
 
     def reset_all_adjustments(self):
@@ -913,8 +953,10 @@ class LogoAdderUltra(QMainWindow):
             self.preset_menu.setCurrentText(names[0])
 
     def persist_presets(self):
-        data = self.current_config() if hasattr(self, "output_format_menu") else self.config.copy()
-        data.pop("folder_path", None)
+        data = {
+            "presets": self.config.get("presets", {}),
+            "selected_preset": self.config.get("selected_preset", ""),
+        }
         saved = save_config(data)
         if not saved and hasattr(self, "log_box"):
             self.write_log(f"! {get_config_error()}")
@@ -1014,6 +1056,7 @@ class LogoAdderUltra(QMainWindow):
             self.config["presets"][name] = preset_from_settings(self.current_config())
             self.refresh_preset_menu()
             self.preset_menu.setCurrentText(name)
+            self.config["selected_preset"] = name
             if not self.persist_presets():
                 self.themed_message_dialog("បញ្ហា Config", get_config_error() or "មិនអាចរក្សាទុក config បានទេ", danger=True)
             self.write_log(f"> បានរក្សាទុកPreset: {name}")
@@ -1151,6 +1194,8 @@ class LogoAdderUltra(QMainWindow):
             return
         del self.config["presets"][name]
         self.refresh_preset_menu()
+        selected = self.preset_menu.currentText()
+        self.config["selected_preset"] = selected if selected in self.config.get("presets", {}) else ""
         if not self.persist_presets():
             self.themed_message_dialog("បញ្ហា Config", get_config_error() or "មិនអាចរក្សាទុក config បានទេ", danger=True)
         self.write_log(f"> បានលុប Preset: {name}")

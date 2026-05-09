@@ -130,6 +130,15 @@ def material_qss():
         font-family: {FONT_STACK};
         font-size: 13px;
     }}
+    QToolTip {{
+        background: #06152d;
+        color: {THEME["text"]};
+        border: 1px solid rgba(71, 220, 255, 0.46);
+        border-radius: 10px;
+        padding: 8px 10px;
+        font-family: {FONT_STACK};
+        font-size: 12px;
+    }}
     QFrame#sidebar {{
         background: {sidebar_gradient};
     }}
