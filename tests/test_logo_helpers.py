@@ -4,8 +4,11 @@ from pathlib import Path
 
 import logo_core
 from logo_core import (
+    ADJUSTMENT_DEFAULTS,
     DEFAULT_OUTPUT_SETTINGS,
     KHMER_POSITIONS,
+    apply_photo_adjustments,
+    auto_adjust_image,
     build_error_summary,
     build_output_path,
     calculate_logo_size,
@@ -13,12 +16,15 @@ from logo_core import (
     calculate_scale_anchor,
     contained_preview_size,
     detect_image_orientation,
+    estimate_auto_adjustments,
     is_duplicate_preset_name,
     is_dialog_confirm_key,
     is_supported_image,
     initialize_logo_worker,
+    normalize_adjustments,
     normalize_output_settings,
     normalize_selected_image_paths,
+    nearest_quality_preset,
     preset_from_settings,
     open_rgba_image,
     process_logo_task,
@@ -31,37 +37,40 @@ from logo_core import (
     slider_value_from_position,
     unique_output_path,
 )
+from ui_text import from_khmer_digits, to_khmer_digits
 
 
 class LogoHelperTests(unittest.TestCase):
     def test_supported_image_extensions_are_case_insensitive(self):
         self.assertTrue(is_supported_image("photo.JPG"))
         self.assertTrue(is_supported_image("poster.webp"))
+        self.assertTrue(is_supported_image("camera.HEIC"))
+        self.assertTrue(is_supported_image("camera.heif"))
         self.assertFalse(is_supported_image("notes.txt"))
 
     def test_logo_size_never_returns_zero_dimensions(self):
         self.assertEqual(calculate_logo_size(3, 3, 2, 1, 5), (1, 1))
 
     def test_logo_size_keeps_aspect_ratio(self):
-        self.assertEqual(calculate_logo_size(2000, 1000, 1000, 400, 10), (200, 80))
+        self.assertEqual(calculate_logo_size(2000, 1000, 1000, 400, 10), (100, 40))
 
-    def test_logo_size_uses_longest_edge_for_landscape_and_portrait(self):
+    def test_logo_size_uses_shortest_edge_for_landscape_and_portrait(self):
         landscape = calculate_logo_size(2000, 1000, 1000, 400, 5)
         portrait = calculate_logo_size(1000, 2000, 1000, 400, 5)
 
-        self.assertEqual(landscape, (100, 40))
+        self.assertEqual(landscape, (50, 20))
         self.assertEqual(portrait, landscape)
 
     def test_logo_size_scales_proportionally_for_mixed_resolutions(self):
         large = calculate_logo_size(3000, 2000, 1000, 400, 5)
         small = calculate_logo_size(1200, 800, 1000, 400, 5)
 
-        self.assertEqual(large, (150, 60))
-        self.assertEqual(small, (60, 24))
+        self.assertEqual(large, (100, 40))
+        self.assertEqual(small, (40, 16))
 
-    def test_scale_anchor_uses_longest_edge(self):
-        self.assertEqual(calculate_scale_anchor(1200, 800), 1200)
-        self.assertEqual(calculate_scale_anchor(800, 1200), 1200)
+    def test_scale_anchor_uses_shortest_edge(self):
+        self.assertEqual(calculate_scale_anchor(1200, 800), 800)
+        self.assertEqual(calculate_scale_anchor(800, 1200), 800)
 
     def test_image_orientation_detection_uses_base_dimensions(self):
         self.assertEqual(detect_image_orientation(2000, 1000), "landscape")
@@ -129,6 +138,105 @@ class LogoHelperTests(unittest.TestCase):
 
             self.assertEqual(result.size, (40, 80))
 
+    def test_adjustment_settings_are_clamped_and_defaulted(self):
+        settings = normalize_adjustments(
+            {
+                "brightness": 500,
+                "highlight": -500,
+                "contrast": "bad",
+                "saturation": 20,
+                "sharpness": 300,
+                "warmth": -20,
+                "rotation": 91,
+                "flip_horizontal": True,
+                "flip_vertical": False,
+                "auto": True,
+            }
+        )
+
+        self.assertEqual(normalize_adjustments({}), ADJUSTMENT_DEFAULTS)
+        self.assertEqual(settings["brightness"], 100)
+        self.assertEqual(settings["highlight"], -100)
+        self.assertEqual(settings["contrast"], 0)
+        self.assertEqual(settings["saturation"], 20)
+        self.assertEqual(settings["sharpness"], 100)
+        self.assertEqual(settings["warmth"], -20)
+        self.assertEqual(settings["rotation"], 0)
+        self.assertEqual(settings["flip_horizontal"], 1)
+        self.assertEqual(settings["flip_vertical"], 0)
+        self.assertEqual(settings["auto"], 1)
+
+    def test_photo_adjustments_change_pixels_and_keep_rgba(self):
+        from PIL import Image
+
+        image = Image.new("RGBA", (4, 4), (100, 110, 120, 200))
+        result = apply_photo_adjustments(
+            image,
+            {
+                "brightness": 20,
+                "contrast": 10,
+                "saturation": 25,
+                "sharpness": 30,
+                "warmth": 40,
+            },
+        )
+
+        self.assertEqual(result.mode, "RGBA")
+        self.assertNotEqual(result.getpixel((0, 0)), image.getpixel((0, 0)))
+        self.assertEqual(result.getpixel((0, 0))[3], 200)
+
+    def test_highlight_adjustment_changes_bright_pixels_more_than_dark_pixels(self):
+        from PIL import Image
+
+        image = Image.new("RGBA", (2, 1))
+        image.putpixel((0, 0), (50, 50, 50, 255))
+        image.putpixel((1, 0), (230, 230, 230, 255))
+
+        result = apply_photo_adjustments(image, {"highlight": -50})
+
+        self.assertEqual(result.getpixel((0, 0))[0], 50)
+        self.assertLess(result.getpixel((1, 0))[0], 230)
+
+    def test_photo_adjustment_rotation_changes_dimensions(self):
+        from PIL import Image
+
+        image = Image.new("RGBA", (40, 20), "white")
+        result = apply_photo_adjustments(image, {"rotation": 90})
+
+        self.assertEqual(result.size, (20, 40))
+
+    def test_photo_adjustment_flips_pixels(self):
+        from PIL import Image
+
+        image = Image.new("RGBA", (2, 1))
+        image.putpixel((0, 0), (255, 0, 0, 255))
+        image.putpixel((1, 0), (0, 0, 255, 255))
+
+        result = apply_photo_adjustments(image, {"flip_horizontal": 1})
+
+        self.assertEqual(result.getpixel((0, 0)), (0, 0, 255, 255))
+        self.assertEqual(result.getpixel((1, 0)), (255, 0, 0, 255))
+
+    def test_auto_adjust_returns_valid_rgba_image(self):
+        from PIL import Image
+
+        image = Image.new("RGBA", (8, 8), (80, 90, 100, 180))
+        result = auto_adjust_image(image)
+
+        self.assertEqual(result.mode, "RGBA")
+        self.assertEqual(result.size, image.size)
+
+    def test_estimate_auto_adjustments_returns_slider_settings(self):
+        from PIL import Image
+
+        image = Image.new("RGBA", (8, 8), (70, 80, 95, 255))
+        settings = estimate_auto_adjustments(image)
+
+        self.assertIn("brightness", settings)
+        self.assertIn("contrast", settings)
+        self.assertEqual(settings["auto"], 0)
+        self.assertEqual(settings["rotation"], 0)
+
     def test_output_path_uses_suffix_and_selected_format(self):
         settings = normalize_output_settings({"format": "PNG", "name_prefix": "EOA", "folder_name": "Export"})
 
@@ -176,6 +284,18 @@ class LogoHelperTests(unittest.TestCase):
 
         self.assertEqual(str(result).replace("\\", "/"), "C:/Images/Outputs/EOA-3.JPEG")
 
+    def test_output_path_converts_heic_same_as_source_to_jpg(self):
+        result = build_output_path("C:/Images", "photo.HEIC", DEFAULT_OUTPUT_SETTINGS, 3)
+
+        self.assertEqual(str(result).replace("\\", "/"), "C:/Images/Outputs/EOA-3.jpg")
+
+    def test_output_path_can_keep_source_name(self):
+        settings = normalize_output_settings({"format": "JPG", "use_source_name": True, "folder_name": "Ready"})
+
+        result = build_output_path("C:/Images", "IMG_001.png", settings, 3)
+
+        self.assertEqual(str(result).replace("\\", "/"), "C:/Images/Ready/IMG_001.jpg")
+
     def test_save_output_image_converts_jpg_to_rgb(self):
         with TemporaryDirectory() as temp_dir:
             from PIL import Image
@@ -208,6 +328,12 @@ class LogoHelperTests(unittest.TestCase):
         self.assertEqual(settings["quality"], 100)
         self.assertEqual(settings["name_prefix"], "EOA")
         self.assertEqual(settings["folder_name"], "Outputs")
+        self.assertFalse(settings["use_source_name"])
+
+    def test_quality_values_snap_to_nearest_preset(self):
+        self.assertEqual(nearest_quality_preset(84), 85)
+        self.assertEqual(nearest_quality_preset(90), 92)
+        self.assertEqual(nearest_quality_preset(98), 100)
 
     def test_output_settings_sanitize_path_parts(self):
         settings = normalize_output_settings(
@@ -237,6 +363,7 @@ class LogoHelperTests(unittest.TestCase):
                 "folder_path": "C:/DoNotStore",
                 "logo_path": "C:/logo.png",
                 "output": {"format": "WebP", "quality": 88, "name_prefix": "EOA", "folder_name": "Ready"},
+                "adjustments": {"brightness": 10, "rotation": 90, "auto": 1},
             }
         )
 
@@ -244,8 +371,23 @@ class LogoHelperTests(unittest.TestCase):
         self.assertEqual(preset["logo_path"], "C:/logo.png")
         self.assertNotIn("folder_path", preset)
         self.assertEqual(preset["output"]["format"], "WebP")
-        self.assertEqual(preset["output"]["quality"], 88)
+        self.assertEqual(preset["output"]["quality"], 85)
         self.assertEqual(preset["output"]["name_prefix"], "EOA")
+        self.assertEqual(preset["adjustments"]["brightness"], 10)
+        self.assertEqual(preset["adjustments"]["rotation"], 90)
+        self.assertEqual(preset["adjustments"]["auto"], 1)
+
+    def test_preset_margins_are_clamped_to_200(self):
+        preset = preset_from_settings({"m_top": 500, "m_bottom": 300, "m_left": 201, "m_right": 200})
+
+        self.assertEqual(preset["m_top"], 200)
+        self.assertEqual(preset["m_bottom"], 200)
+        self.assertEqual(preset["m_left"], 200)
+        self.assertEqual(preset["m_right"], 200)
+
+    def test_khmer_digit_display_helpers_round_trip(self):
+        self.assertEqual(to_khmer_digits("100 / 200"), "១០០ / ២០០")
+        self.assertEqual(from_khmer_digits("១០០"), "100")
 
     def test_config_save_load_round_trip_uses_config_file(self):
         with TemporaryDirectory() as temp_dir:
@@ -307,3 +449,4 @@ class LogoHelperTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+    auto_adjust_image,

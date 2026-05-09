@@ -10,8 +10,11 @@ LogoAdder lets you:
 - Select a logo image.
 - Preview the logo placement before exporting.
 - Adjust logo size, opacity, position, and margins.
+- Adjust photos with brightness, highlight, contrast, saturation, sharpness, warm/cool tone, rotation, and simple auto enhancement.
 - Choose output format, quality, file name prefix, and output folder name.
 - Export processed images into a separate output folder.
+
+Supported input formats include PNG, JPG/JPEG, WebP, BMP, TIFF, HEIC, and HEIF. HEIC/HEIF files are decoded through `pillow-heif`; when output format is set to `Same as source`, HEIC/HEIF inputs are exported as JPG because Pillow does not save HEIC by default.
 
 ## Requirements
 
@@ -80,7 +83,7 @@ The build uses PyInstaller one-file mode so users can receive only one app file.
 
 The build bundles:
 
-- `assets/myicon.ico`
+- `assets/applogo.ico`
 - `assets/Title Logo.png`
 - `assets/KhmerOSmuollight.ttf`
 - `assets/KhmerOSsiemreap.ttf`

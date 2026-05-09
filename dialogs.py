@@ -5,7 +5,7 @@ from logo_core import resource_path
 
 
 def apply_app_icon(dialog):
-    icon_path = resource_path("myicon.ico")
+    icon_path = resource_path("applogo.ico")
     if icon_path.exists():
         dialog.setWindowIcon(QIcon(str(icon_path)))
 

@@ -110,17 +110,18 @@ The build intentionally uses PyInstaller one-file mode so users can receive one 
 
 The build bundles:
 
-- `assets/myicon.ico`
+- `assets/applogo.ico`
 - `assets/Title Logo.png`
 - `assets/KhmerOSmuollight.ttf`
 - `assets/KhmerOSsiemreap.ttf`
+- `assets/brown cheese.otf`
 
 ## Config And Paths
 
 - User presets are stored at `%APPDATA%\LogoAdder\config.json` on Windows.
 - `folder_path` is intentionally session-only so startup does not touch an old photo folder.
 - Output folder names and file name prefixes are sanitized in `logo_core.py`.
-- Use `resource_path()` for bundled read-only assets such as `myicon.ico`, `Title Logo.png`, and bundled fonts. Source assets live in `assets/`.
+- Use `resource_path()` for bundled read-only assets such as `applogo.ico`, `Title Logo.png`, SVG icons, and bundled fonts. Source assets live in `assets/`.
 
 ## Development Notes
 

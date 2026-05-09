@@ -6,10 +6,12 @@ import webbrowser
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
     QDialog,
     QFileDialog,
     QFrame,
@@ -30,29 +32,37 @@ from PySide6.QtWidgets import (
 import logo_core as core
 from dialogs import apply_app_icon, fit_dialog_to_screen
 from logo_core import (
+    ADJUSTMENT_DEFAULTS,
     KHMER_POSITIONS,
+    MARGIN_MAX,
     OUTPUT_FORMATS,
     POSITION_VALUES,
     PREVIEW_SIZE,
+    apply_photo_adjustments,
     build_output_path,
     compose_logo,
+    estimate_auto_adjustments,
     get_config_error,
     is_duplicate_preset_name,
     list_images,
     load_config,
+    normalize_adjustments,
     normalize_output_settings,
     normalize_position,
+    nearest_quality_preset,
     normalize_selected_image_paths,
     open_rgba_image,
     preset_from_settings,
     resource_path,
     save_config,
 )
+from ui_text import from_khmer_digits, to_khmer_digits
 from preview import pil_to_pixmap, ui_font
 from styles import (
     APP_TITLE,
     COMPACT_WINDOW_HEIGHT,
     COMPACT_WINDOW_WIDTH,
+    CREATOR_FONT_FAMILY,
     SITE_STYLE,
     THEME,
     TITLE_FONT_FAMILY,
@@ -64,6 +74,22 @@ from styles import (
 )
 from ui_widgets import DropOverlay, FriendlySlider, LiveHeader, MaterialComboBox, PreviewLabel, ShortcutConfirmDialog
 from workers import run_processing_worker
+
+
+QUALITY_OPTIONS = (
+    (85, "ស្តង់ដារ"),
+    (92, "គុណភាពល្អ"),
+    (100, "គុណភាពខ្ពស់"),
+)
+
+ADJUSTMENT_SLIDERS = (
+    ("brightness", "Brightness", -100, 100),
+    ("highlight", "Highlight", -100, 100),
+    ("contrast", "Contrast", -100, 100),
+    ("saturation", "Saturation", -100, 100),
+    ("sharpness", "Sharpness", 0, 100),
+    ("warmth", "Warm / Cool", -100, 100),
+)
 
 
 class LogoAdderUltra(QMainWindow):
@@ -90,6 +116,9 @@ class LogoAdderUltra(QMainWindow):
         self.preview_logo_cache = {"path": None, "image": None}
         self.preview_hover_action = ""
         self.preview_nav_hitboxes = {}
+        self.photo_adjustments = {}
+        self.adjustment_dialog = None
+        QApplication.instance().installEventFilter(self)
 
         self.setup_window()
         self.create_layout()
@@ -106,7 +135,7 @@ class LogoAdderUltra(QMainWindow):
         self.setFixedSize(screen_fitting_window_size())
         center_window_on_screen(self)
         QApplication.instance().setFont(make_font(10))
-        icon_path = resource_path("myicon.ico")
+        icon_path = resource_path("applogo.ico")
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
         self.setAcceptDrops(True)
@@ -180,9 +209,11 @@ class LogoAdderUltra(QMainWindow):
         by = QLabel("បង្កើតឡើងដោយ")
         by.setAlignment(Qt.AlignCenter)
         by.setObjectName("mutedLabel")
-        self.creator_label = QLabel("THANUN")
+        by.setFont(make_font(11, family=TITLE_FONT_FAMILY))
+        self.creator_label = QLabel("Thanun")
         self.creator_label.setAlignment(Qt.AlignCenter)
         self.creator_label.setObjectName("creatorLabel")
+        self.creator_label.setFont(make_font(27, family=CREATOR_FONT_FAMILY))
         self.creator_label.setCursor(Qt.PointingHandCursor)
         self.creator_label.mousePressEvent = lambda _event: webbrowser.open("https://www.facebook.com/thanun2903/")
         footer_layout.addWidget(by)
@@ -235,7 +266,7 @@ class LogoAdderUltra(QMainWindow):
             ("m_left", "Margin ឆ្វេង"),
             ("m_right", "Margin ស្តាំ"),
         ):
-            self.create_input_group(f"{label} (px)", key, 0, 500, self.config[key], store_margin=True)
+            self.create_input_group(f"{label} (px)", key, 0, MARGIN_MAX, self.config[key], store_margin=True)
 
         self.update_margin_visibility()
         self.create_output_settings()
@@ -250,8 +281,15 @@ class LogoAdderUltra(QMainWindow):
         main_layout.setSpacing(12)
         parent_layout.addWidget(self.main_area, 1)
 
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
         self.live_header = LiveHeader()
-        main_layout.addWidget(self.live_header)
+        self.btn_adjust_photo = self.create_button("កែរូបភាព", self.open_adjustment_dialog)
+        self.btn_adjust_photo.setProperty("smallAction", True)
+        self.refresh_style(self.btn_adjust_photo)
+        header_row.addWidget(self.live_header, 1)
+        header_row.addWidget(self.btn_adjust_photo, 0, Qt.AlignRight | Qt.AlignVCenter)
+        main_layout.addLayout(header_row)
 
         self.preview_container = QFrame()
         self.preview_container.setObjectName("previewContainer")
@@ -270,7 +308,7 @@ class LogoAdderUltra(QMainWindow):
         status_row = QHBoxLayout()
         self.status_label = QLabel("លទ្ធផល")
         self.status_label.setObjectName("statusLabel")
-        self.count_label = QLabel("0 / 0")
+        self.count_label = QLabel(to_khmer_digits("0 / 0"))
         self.count_label.setObjectName("mutedLabel")
         status_row.addWidget(self.status_label)
         status_row.addStretch(1)
@@ -280,6 +318,8 @@ class LogoAdderUltra(QMainWindow):
         self.log_box = QPlainTextEdit()
         self.log_box.setObjectName("terminal")
         self.log_box.setReadOnly(True)
+        self.log_box.setFocusPolicy(Qt.NoFocus)
+        self.log_box.setTextInteractionFlags(Qt.NoTextInteraction)
         log_height = 110 if self.height() < COMPACT_WINDOW_HEIGHT else 150
         self.log_box.setMinimumHeight(log_height)
         self.log_box.setMaximumHeight(log_height)
@@ -350,21 +390,76 @@ class LogoAdderUltra(QMainWindow):
         self.output_format_menu.setCurrentText(output["format"])
         self.sidebar_layout.addWidget(self.output_format_menu)
 
-        self.create_input_group("គុណភាពរូបភាព", "output_quality", 1, 100, output["quality"])
-        self.output_suffix_entry = self.create_text_entry("កំណត់ឈ្មោះរូបភាព", output["name_prefix"])
-        self.output_folder_entry = self.create_text_entry("កំណត់ឈ្មោះFolder", output["folder_name"])
+        self.create_quality_selector(output["quality"])
+        self.output_suffix_entry = self.create_text_entry("កំណត់ឈ្មោះរូបភាព", output["name_prefix"], inline_widget=self.create_source_name_checkbox(output["use_source_name"]), title_style=True)
+        self.on_source_name_toggle(output["use_source_name"])
+        self.output_folder_entry = self.create_text_entry("កំណត់ឈ្មោះFolder", output["folder_name"], title_style=True)
 
-    def create_text_entry(self, label_text, value):
+    def create_source_name_checkbox(self, checked):
+        self.use_source_name_checkbox = QCheckBox("ប្រើឈ្មោះដើម")
+        self.use_source_name_checkbox.setObjectName("sourceNameCheck")
+        self.use_source_name_checkbox.setChecked(checked)
+        self.use_source_name_checkbox.toggled.connect(self.on_source_name_toggle)
+        self.controls_to_disable.append(self.use_source_name_checkbox)
+        return self.use_source_name_checkbox
+
+    def create_quality_selector(self, current_quality):
         frame = QFrame()
         frame.setObjectName("plainInputGroup")
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(0, 0, 0, 0)
+        label = QLabel("គុណភាពរូបភាព")
+        label.setObjectName("sectionLabel")
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self.quality_buttons = {}
+        self.output_quality_value = nearest_quality_preset(current_quality)
+        for value, text in QUALITY_OPTIONS:
+            button = QPushButton(text)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setFocusPolicy(Qt.NoFocus)
+            button.setProperty("qualityOption", True)
+            button.clicked.connect(lambda _checked=False, selected=value: self.set_quality_value(selected))
+            row.addWidget(button)
+            self.quality_buttons[value] = button
+            self.controls_to_disable.append(button)
+        layout.addWidget(label)
+        layout.addLayout(row)
+        self.sidebar_layout.addWidget(frame)
+        self.set_quality_value(self.output_quality_value, notify=False)
+
+    def set_quality_value(self, value, notify=True):
+        self.output_quality_value = nearest_quality_preset(value)
+        for option_value, button in self.quality_buttons.items():
+            button.setProperty("selected", "true" if option_value == self.output_quality_value else "false")
+            self.refresh_style(button)
+        if notify:
+            self.on_output_setting_change()
+
+    def on_source_name_toggle(self, checked):
+        if hasattr(self, "output_suffix_entry"):
+            self.output_suffix_entry.setEnabled(not checked)
+            self.output_suffix_entry.setProperty("sourceNameDisabled", "true" if checked else "false")
+            self.refresh_style(self.output_suffix_entry)
+        self.on_output_setting_change()
+
+    def create_text_entry(self, label_text, value, inline_widget=None, title_style=False):
+        frame = QFrame()
+        frame.setObjectName("plainInputGroup")
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(0, 0, 0, 0)
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
         label = QLabel(label_text)
-        label.setObjectName("fieldLabel")
+        label.setObjectName("sectionLabel" if title_style else "fieldLabel")
+        header.addWidget(label)
+        if inline_widget is not None:
+            header.addStretch(1)
+            header.addWidget(inline_widget)
         entry = QLineEdit(value)
         entry.setObjectName("textEntry")
         entry.textChanged.connect(self.on_output_setting_change)
-        layout.addWidget(label)
+        layout.addLayout(header)
         layout.addWidget(entry)
         self.sidebar_layout.addWidget(frame)
         self.controls_to_disable.append(entry)
@@ -393,11 +488,11 @@ class LogoAdderUltra(QMainWindow):
         slider = FriendlySlider(Qt.Horizontal)
         slider.setRange(min_val, max_val)
         slider.setValue(value)
-        entry.setText(str(value))
+        entry.setText(to_khmer_digits(value))
 
         def on_slider(new_value):
             self.is_updating_from_slider = True
-            entry.setText(str(int(new_value)))
+            entry.setText(to_khmer_digits(int(new_value)))
             self.is_updating_from_slider = False
             self.on_slider_move()
 
@@ -405,7 +500,7 @@ class LogoAdderUltra(QMainWindow):
             if self.is_updating_from_slider or not text.strip():
                 return
             try:
-                new_value = int(text)
+                new_value = int(from_khmer_digits(text))
             except ValueError:
                 return
             if min_val <= new_value <= max_val:
@@ -422,6 +517,293 @@ class LogoAdderUltra(QMainWindow):
         if store_margin:
             self.margin_widgets[config_key] = frame
         return self.inputs[config_key]
+
+    def current_photo_key(self):
+        if self.image_list and 0 <= self.current_preview_index < len(self.image_list):
+            return self.image_list[self.current_preview_index]
+        return None
+
+    def effective_adjustments(self, filename=None):
+        key = filename if filename is not None else self.current_photo_key()
+        if key and key in self.photo_adjustments:
+            return normalize_adjustments(self.photo_adjustments[key])
+        return normalize_adjustments(self.config.get("adjustments"))
+
+    def target_adjustments(self):
+        key = self.current_photo_key()
+        if key:
+            return normalize_adjustments(self.photo_adjustments.get(key, self.config.get("adjustments")))
+        return normalize_adjustments(self.config.get("adjustments"))
+
+    def save_target_adjustments(self, adjustments):
+        adjustments = normalize_adjustments(adjustments)
+        key = self.current_photo_key()
+        if key:
+            self.photo_adjustments[key] = adjustments
+        else:
+            self.config["adjustments"] = adjustments
+            self.config.update(self.current_config())
+        self.update_adjustment_status()
+        self.on_slider_move()
+
+    def apply_adjustments_to_all(self):
+        settings = self.target_adjustments()
+        self.config["adjustments"] = settings
+        self.photo_adjustments.clear()
+        self.config.update(self.current_config())
+        self.on_slider_move()
+        self.load_adjustment_dialog_values()
+        self.update_adjustment_status("បានអនុវត្តការកែនេះទៅរូបភាពទាំងអស់")
+
+    def create_adjustment_slider(self, parent_layout, key, label_text, min_val, max_val):
+        frame = QFrame()
+        frame.setObjectName("inputGroup")
+        frame.setFixedHeight(68)
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(18)
+        label = QLabel(label_text)
+        label.setObjectName("fieldLabel")
+        label.setFixedHeight(34)
+        label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        entry = QLineEdit()
+        entry.setObjectName("numberEntry")
+        entry.setFocusPolicy(Qt.ClickFocus)
+        entry.setAlignment(Qt.AlignCenter)
+        entry.setFixedWidth(62)
+        entry.setFixedHeight(34)
+        row.addWidget(label)
+        row.addStretch(1)
+        row.addWidget(entry, 0, Qt.AlignTop)
+        slider = FriendlySlider(Qt.Horizontal)
+        slider.setRange(min_val, max_val)
+        slider.setSingleStep(1)
+        slider.setFixedHeight(26)
+        slider.setFocusPolicy(Qt.StrongFocus)
+        slider.setProperty("wheelAdjust", True)
+
+        def on_slider(value):
+            entry.setText(to_khmer_digits(int(value)))
+            settings = self.target_adjustments()
+            settings[key] = int(value)
+            self.save_target_adjustments(settings)
+
+        def on_entry(text):
+            if not text.strip():
+                return
+            try:
+                value = int(from_khmer_digits(text))
+            except ValueError:
+                return
+            if min_val <= value <= max_val:
+                slider.setValue(value)
+
+        slider.valueChanged.connect(on_slider)
+        entry.textChanged.connect(on_entry)
+        layout.addLayout(row)
+        layout.addWidget(slider)
+        parent_layout.addWidget(frame)
+        self.adjustment_widgets[key] = {"slider": slider, "entry": entry}
+
+    def load_adjustment_dialog_values(self):
+        if not hasattr(self, "adjustment_widgets"):
+            return
+        settings = self.target_adjustments()
+        for key, widgets in self.adjustment_widgets.items():
+            slider = widgets["slider"]
+            entry = widgets["entry"]
+            slider.blockSignals(True)
+            entry.blockSignals(True)
+            slider.setValue(settings[key])
+            entry.setText(to_khmer_digits(settings[key]))
+            entry.blockSignals(False)
+            slider.blockSignals(False)
+        self.update_adjustment_status()
+
+    def update_adjustment_status(self, message=None):
+        if not hasattr(self, "adjustment_status"):
+            return
+        if message:
+            self.set_adjustment_status_text(message)
+            return
+        key = self.current_photo_key()
+        if key and self.image_list:
+            self.set_adjustment_status_text(f"កំពុងកែរូបទី {to_khmer_digits(self.current_preview_index + 1)} / {to_khmer_digits(len(self.image_list))}: {key}")
+        else:
+            self.set_adjustment_status_text("សូមជ្រើសរើសរូបភាពមួយ ដើម្បីកែរូបនោះ")
+
+    def set_adjustment_status_text(self, text):
+        if not hasattr(self, "adjustment_status"):
+            return
+        width = max(120, self.adjustment_status.width() - 8)
+        shown_text = self.adjustment_status.fontMetrics().elidedText(str(text), Qt.ElideRight, width)
+        self.adjustment_status.setText(shown_text)
+        self.adjustment_status.setToolTip(str(text))
+
+    def open_adjustment_dialog(self):
+        if self.adjustment_dialog and self.adjustment_dialog.isVisible():
+            self.adjustment_dialog.raise_()
+            self.adjustment_dialog.activateWindow()
+            return
+
+        dialog = QDialog(self)
+        self.adjustment_dialog = dialog
+        dialog.setWindowTitle("កែរូបភាព")
+        dialog.setObjectName("materialDialog")
+        dialog.setModal(False)
+        dialog.setWindowModality(Qt.NonModal)
+        fit_dialog_to_screen(dialog, 420, 720)
+        apply_app_icon(dialog)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(8)
+        title = QLabel("កែរូបភាព")
+        title.setObjectName("dialogTitle")
+        title.setAlignment(Qt.AlignCenter)
+        title.setFocusPolicy(Qt.StrongFocus)
+        layout.addWidget(title)
+
+        self.adjustment_status = QLabel("")
+        self.adjustment_status.setObjectName("hintLabel")
+        self.adjustment_status.setAlignment(Qt.AlignCenter)
+        self.adjustment_status.setWordWrap(False)
+        self.adjustment_status.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.adjustment_status.setTextInteractionFlags(Qt.NoTextInteraction)
+        layout.addWidget(self.adjustment_status)
+
+        top_action_row = QHBoxLayout()
+        top_action_row.addStretch(1)
+        reset_btn = QPushButton("Reset")
+        auto_btn = QPushButton("Auto")
+        reset_btn.setProperty("variant", "danger")
+        auto_btn.setProperty("variant", "primary")
+        for button in (reset_btn, auto_btn):
+            button.setCursor(Qt.PointingHandCursor)
+            button.setFocusPolicy(Qt.NoFocus)
+            button.setProperty("dialogButton", True)
+        reset_btn.clicked.connect(self.reset_adjustments)
+        auto_btn.clicked.connect(self.enable_auto_adjustment)
+        top_action_row.addWidget(auto_btn)
+        top_action_row.addWidget(reset_btn)
+        layout.addLayout(top_action_row)
+
+        self.adjustment_widgets = {}
+        for key, label_text, min_val, max_val in ADJUSTMENT_SLIDERS:
+            self.create_adjustment_slider(layout, key, label_text, min_val, max_val)
+
+        transform_row = QHBoxLayout()
+        transform_label = QLabel("បង្វិលរូបភាព")
+        transform_label.setObjectName("fieldLabel")
+        rotate_left_btn = QPushButton()
+        flip_vertical_btn = QPushButton()
+        flip_horizontal_btn = QPushButton()
+        rotate_left_btn.setIcon(QIcon(str(resource_path("arrows-clockwise.svg"))))
+        flip_vertical_btn.setIcon(QIcon(str(resource_path("flip-vertical.svg"))))
+        flip_horizontal_btn.setIcon(QIcon(str(resource_path("flip-horizontal.svg"))))
+        for button in (rotate_left_btn, flip_vertical_btn, flip_horizontal_btn):
+            button.setIconSize(QSize(22, 22))
+        rotate_left_btn.setToolTip("Rotate 90° left")
+        flip_vertical_btn.setToolTip("Flip vertical")
+        flip_horizontal_btn.setToolTip("Flip horizontal")
+        for button in (rotate_left_btn, flip_vertical_btn, flip_horizontal_btn):
+            button.setCursor(Qt.PointingHandCursor)
+            button.setFocusPolicy(Qt.NoFocus)
+            button.setProperty("iconButton", True)
+        rotate_left_btn.clicked.connect(self.rotate_current_left)
+        flip_vertical_btn.clicked.connect(lambda: self.toggle_adjustment_flag("flip_vertical"))
+        flip_horizontal_btn.clicked.connect(lambda: self.toggle_adjustment_flag("flip_horizontal"))
+        transform_row.addWidget(transform_label, 1)
+        transform_row.addWidget(rotate_left_btn)
+        transform_row.addWidget(flip_vertical_btn)
+        transform_row.addWidget(flip_horizontal_btn)
+        layout.addLayout(transform_row)
+        layout.addSpacing(8)
+
+        action_row = QHBoxLayout()
+        apply_all_btn = QPushButton("Apply to all")
+        reset_all_btn = QPushButton("Reset all")
+        apply_all_btn.setProperty("variant", "primary")
+        reset_all_btn.setProperty("variant", "danger")
+        for button in (apply_all_btn, reset_all_btn):
+            button.setCursor(Qt.PointingHandCursor)
+            button.setFocusPolicy(Qt.NoFocus)
+            button.setProperty("dialogButton", True)
+            button.setProperty("wideDialogButton", True)
+        apply_all_btn.clicked.connect(self.apply_adjustments_to_all)
+        reset_all_btn.clicked.connect(self.reset_all_adjustments)
+        action_row.addWidget(apply_all_btn)
+        action_row.addWidget(reset_all_btn)
+        layout.addLayout(action_row)
+
+        self.load_adjustment_dialog_values()
+        dialog.finished.connect(lambda _result: setattr(self, "adjustment_dialog", None))
+        self.position_adjustment_dialog(dialog)
+
+        def clear_text_focus(event):
+            focus = QApplication.focusWidget()
+            if isinstance(focus, QLineEdit):
+                focus.clearFocus()
+            QDialog.mousePressEvent(dialog, event)
+
+        dialog.mousePressEvent = clear_text_focus
+        dialog.show()
+        title.setFocus(Qt.OtherFocusReason)
+        self.update_adjustment_status()
+        dialog.raise_()
+
+    def position_adjustment_dialog(self, dialog):
+        screen = dialog.screen() or QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen else None
+        anchor = self.preview_container.mapToGlobal(self.preview_container.rect().topRight())
+        x = anchor.x() + 12
+        y = self.preview_container.mapToGlobal(self.preview_container.rect().topLeft()).y()
+        if available:
+            x = min(x, available.right() - dialog.width() - 8)
+            y = max(available.top() + 8, min(y, available.bottom() - dialog.height() - 8))
+        dialog.move(x, y)
+
+    def rotate_current_left(self):
+        settings = self.target_adjustments()
+        settings["rotation"] = (settings["rotation"] + 90) % 360
+        self.save_target_adjustments(settings)
+
+    def toggle_adjustment_flag(self, key):
+        settings = self.target_adjustments()
+        settings[key] = 0 if settings.get(key) else 1
+        self.save_target_adjustments(settings)
+
+    def enable_auto_adjustment(self):
+        key = self.current_photo_key()
+        folder_path = self.config.get("folder_path")
+        if not key or not folder_path:
+            self.update_adjustment_status("សូមជ្រើសរើសរូបភាពមុនពេលប្រើ Auto")
+            return
+        try:
+            image = open_rgba_image(Path(folder_path) / key)
+            settings = estimate_auto_adjustments(image)
+        except (OSError, ValueError, RuntimeError) as error:
+            self.update_adjustment_status(f"Auto មិនអាចដំណើរការ: {error}")
+            return
+        self.photo_adjustments[key] = settings
+        self.update_adjustment_status(f"បានកែ Auto សម្រាប់រូបនេះ: {key}")
+        self.on_slider_move()
+        self.load_adjustment_dialog_values()
+
+    def reset_adjustments(self):
+        self.save_target_adjustments(ADJUSTMENT_DEFAULTS.copy())
+        self.load_adjustment_dialog_values()
+
+    def reset_all_adjustments(self):
+        self.config["adjustments"] = ADJUSTMENT_DEFAULTS.copy()
+        self.photo_adjustments.clear()
+        self.config.update(self.current_config())
+        self.on_slider_move()
+        self.load_adjustment_dialog_values()
+        self.update_adjustment_status("បានកំណត់ដើមសម្រាប់រូបភាពទាំងអស់")
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -450,6 +832,34 @@ class LogoAdderUltra(QMainWindow):
         else:
             self.themed_message_dialog("ឯកសារមិនគាំទ្រ", "ទម្លាក់Folderរូបភាព ឬរូបភាពដើម្បីកែ! ជ្រើសរើស Logo ដោយប្រើប៊ូតុងជ្រើសរើស Logo។")
 
+    def handle_preview_key_event(self, event):
+        if event.modifiers() not in (Qt.NoModifier, Qt.KeypadModifier):
+            return False
+        focus = QApplication.focusWidget()
+        if isinstance(focus, (QLineEdit, QPlainTextEdit)):
+            return False
+        if event.key() in (Qt.Key_Left, Qt.Key_A):
+            self.prev_photo()
+            return True
+        if event.key() in (Qt.Key_Right, Qt.Key_D):
+            self.next_photo()
+            return True
+        return False
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.KeyPress and hasattr(obj, "window"):
+            event_window = obj.window()
+            dialog_active = self.adjustment_dialog is not None and event_window is self.adjustment_dialog
+            if event_window is self or dialog_active:
+                if self.handle_preview_key_event(event):
+                    return True
+        return super().eventFilter(obj, event)
+
+    def keyPressEvent(self, event):
+        if self.handle_preview_key_event(event):
+            return
+        super().keyPressEvent(event)
+
     def current_margins(self):
         return {
             "top": self.inputs["m_top"]["slider"].value(),
@@ -462,9 +872,10 @@ class LogoAdderUltra(QMainWindow):
         return normalize_output_settings(
             {
                 "format": self.output_format_menu.currentText(),
-                "quality": self.inputs["output_quality"]["slider"].value(),
+                "quality": self.output_quality_value,
                 "name_prefix": self.output_suffix_entry.text(),
                 "folder_name": self.output_folder_entry.text(),
+                "use_source_name": self.use_source_name_checkbox.isChecked(),
             }
         )
 
@@ -480,6 +891,7 @@ class LogoAdderUltra(QMainWindow):
             "m_left": self.inputs["m_left"]["slider"].value(),
             "m_right": self.inputs["m_right"]["slider"].value(),
             "output": self.current_output_settings(),
+            "adjustments": normalize_adjustments(self.config.get("adjustments")),
             "presets": self.config.get("presets", {}),
             "selected_preset": self.preset_menu.currentText(),
         }
@@ -520,9 +932,12 @@ class LogoAdderUltra(QMainWindow):
         for key in ("m_top", "m_bottom", "m_left", "m_right"):
             self.set_input_value(key, int(preset.get(key, 10)))
         output = normalize_output_settings(preset.get("output"))
+        self.config["adjustments"] = normalize_adjustments(preset.get("adjustments"))
         self.output_format_menu.setCurrentText(output["format"])
-        self.set_input_value("output_quality", output["quality"])
+        self.set_quality_value(output["quality"], notify=False)
+        self.use_source_name_checkbox.setChecked(output["use_source_name"])
         self.output_suffix_entry.setText(output["name_prefix"])
+        self.output_suffix_entry.setEnabled(not output["use_source_name"])
         self.output_folder_entry.setText(output["folder_name"])
         logo_path = preset.get("logo_path", "")
         if logo_path and Path(logo_path).exists():
@@ -549,7 +964,7 @@ class LogoAdderUltra(QMainWindow):
 
     def set_input_value(self, key, value):
         self.inputs[key]["slider"].setValue(value)
-        self.inputs[key]["entry"].setText(str(value))
+        self.inputs[key]["entry"].setText(to_khmer_digits(value))
 
     def save_preset_dialog(self):
         dialog = QDialog(self)
@@ -757,7 +1172,8 @@ class LogoAdderUltra(QMainWindow):
             self.on_slider_move()
 
     def on_output_setting_change(self):
-        if hasattr(self, "output_format_menu"):
+        required = ("output_format_menu", "output_quality_value", "output_suffix_entry", "output_folder_entry", "use_source_name_checkbox")
+        if all(hasattr(self, name) for name in required):
             self.config.update(self.current_config())
 
     def on_slider_move(self, *_):
@@ -775,7 +1191,7 @@ class LogoAdderUltra(QMainWindow):
         self.log_box.clear()
 
     def browse_logo(self):
-        path, _ = QFileDialog.getOpenFileName(self, "ជ្រើសរើស Logo", "", "រូបភាព (*.png *.jpg *.jpeg *.webp *.bmp *.tiff *.tif);;ឯកសារទាំងអស់ (*.*)")
+        path, _ = QFileDialog.getOpenFileName(self, "ជ្រើសរើស Logo", "", "រូបភាព (*.png *.jpg *.jpeg *.webp *.bmp *.tiff *.tif *.heic *.heif);;ឯកសារទាំងអស់ (*.*)")
         if path:
             self.set_logo(Path(path))
 
@@ -789,6 +1205,7 @@ class LogoAdderUltra(QMainWindow):
         self.config["logo_path"] = str(path)
         self.logo_path_lbl.setText(self.truncate_path(path))
         self.preview_logo_cache = {"path": None, "image": None}
+        self.preview_canvas.reset_zoom()
         self.update_live_preview()
 
     def browse_folder(self):
@@ -797,7 +1214,7 @@ class LogoAdderUltra(QMainWindow):
             self.set_folder(Path(path))
 
     def browse_photos(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "ជ្រើសរើសរូបភាព", "", "រូបភាព (*.png *.jpg *.jpeg *.webp *.bmp *.tiff *.tif);;ឯកសារទាំងអស់ (*.*)")
+        paths, _ = QFileDialog.getOpenFileNames(self, "ជ្រើសរើសរូបភាព", "", "រូបភាព (*.png *.jpg *.jpeg *.webp *.bmp *.tiff *.tif *.heic *.heif);;ឯកសារទាំងអស់ (*.*)")
         if paths:
             self.set_photo_files([Path(path) for path in paths])
 
@@ -807,12 +1224,14 @@ class LogoAdderUltra(QMainWindow):
             self.themed_message_dialog("រកមិនឃើញរូបភាព", "មិនមានប្រភេទរូបភាពដែលគាំទ្រក្នុង Folder នេះទេ។")
             return
         self.image_list = files
+        self.photo_adjustments.clear()
         self.config["folder_path"] = str(path)
-        self.folder_path_lbl.setText(f"{self.truncate_path(path)} ({len(files)} រូបភាព)")
+        self.folder_path_lbl.setText(f"{self.truncate_path(path)} ({to_khmer_digits(len(files))} រូបភាព)")
         self.current_preview_index = 0
         self.preview_source_cache = {"path": None, "image": None}
+        self.preview_canvas.reset_zoom()
         self.progress.setValue(0)
-        self.count_label.setText(f"0 / {len(files)}")
+        self.count_label.setText(to_khmer_digits(f"0 / {len(files)}"))
         self.btn_open_folder.setEnabled(False)
         self.update_live_preview()
 
@@ -822,13 +1241,15 @@ class LogoAdderUltra(QMainWindow):
             self.themed_message_dialog("រកមិនឃើញរូបភាព", "មិនមានរូបភាពដែលគាំទ្រសម្រាប់បើកទេ។")
             return
         self.image_list = [path.name for path in image_paths]
+        self.photo_adjustments.clear()
         parent = image_paths[0].parent
         self.config["folder_path"] = str(parent)
-        self.folder_path_lbl.setText(f"{len(self.image_list)} រូបភាពពី {self.truncate_path(parent)}")
+        self.folder_path_lbl.setText(f"{to_khmer_digits(len(self.image_list))} រូបភាពពី {self.truncate_path(parent)}")
         self.current_preview_index = 0
         self.preview_source_cache = {"path": None, "image": None}
+        self.preview_canvas.reset_zoom()
         self.progress.setValue(0)
-        self.count_label.setText(f"0 / {len(self.image_list)}")
+        self.count_label.setText(to_khmer_digits(f"0 / {len(self.image_list)}"))
         self.btn_open_folder.setEnabled(False)
         self.update_live_preview()
 
@@ -861,14 +1282,14 @@ class LogoAdderUltra(QMainWindow):
 
         left = (20, center_y - button_size // 2, 20 + button_size, center_y + button_size // 2)
         right = (PREVIEW_SIZE[0] - 20 - button_size, center_y - button_size // 2, PREVIEW_SIZE[0] - 20, center_y + button_size // 2)
-        count_w, count_h = 94, 34
+        count_w, count_h = 110, 40
         count = ((PREVIEW_SIZE[0] - count_w) // 2, PREVIEW_SIZE[1] - count_h - 20, (PREVIEW_SIZE[0] + count_w) // 2, PREVIEW_SIZE[1] - 20)
 
         self.draw_nav_indicator(canvas, left, "<", self.preview_hover_action == "prev")
         self.draw_nav_indicator(canvas, right, ">", self.preview_hover_action == "next")
-        self.draw_glass_rect(canvas, count, radius=17, blur_radius=5, fill=(10, 10, 12, 204), outline=(255, 255, 255, 26), shadow=True)
-        count_font = ui_font(13, bold=True)
-        self.draw_centered_text(draw, count, count_text, SITE_STYLE["cyan"], count_font, letter_spacing=2)
+        self.draw_glass_rect(canvas, count, radius=18, blur_radius=5, fill=(3, 14, 30, 230), outline=(0, 229, 255, 95), shadow=True, shadow_fill=(0, 229, 255, 60))
+        count_font = ui_font(17, bold=True)
+        self.draw_centered_text(draw, count, count_text, "#ffffff", count_font, letter_spacing=1)
 
     def draw_nav_indicator(self, canvas, rect, arrow, hovered):
         if hovered:
@@ -928,12 +1349,16 @@ class LogoAdderUltra(QMainWindow):
     def prev_photo(self):
         if self.image_list:
             self.current_preview_index = (self.current_preview_index - 1) % len(self.image_list)
+            self.preview_canvas.reset_zoom()
             self.update_live_preview()
+            self.load_adjustment_dialog_values()
 
     def next_photo(self):
         if self.image_list:
             self.current_preview_index = (self.current_preview_index + 1) % len(self.image_list)
+            self.preview_canvas.reset_zoom()
             self.update_live_preview()
+            self.load_adjustment_dialog_values()
 
     def truncate_path(self, path, length=46):
         text = str(path)
@@ -958,7 +1383,7 @@ class LogoAdderUltra(QMainWindow):
             if self.preview_source_cache["path"] != str(photo_path):
                 self.preview_source_cache = {"path": str(photo_path), "image": open_rgba_image(photo_path)}
             original = self.preview_source_cache["image"]
-            display = original.copy()
+            display = apply_photo_adjustments(original.copy(), self.effective_adjustments(self.image_list[self.current_preview_index]))
             display.thumbnail((PREVIEW_SIZE[0] - 16, PREVIEW_SIZE[1] - 16), Image.LANCZOS)
             preview = display
             if logo_path and Path(logo_path).exists():
@@ -974,9 +1399,10 @@ class LogoAdderUltra(QMainWindow):
             canvas.paste(preview, offset)
             canvas_draw = ImageDraw.Draw(canvas)
             canvas_draw.rectangle((offset[0] - 2, offset[1] - 2, offset[0] + preview.width + 1, offset[1] + preview.height + 1), outline=(86, 204, 242, 235), width=2)
-            count_text = f"{self.current_preview_index + 1} / {len(self.image_list)}"
+            count_text = to_khmer_digits(f"{self.current_preview_index + 1} / {len(self.image_list)}")
             self.draw_preview_controls(canvas, count_text)
             self.count_label.setText(count_text)
+            self.preview_canvas.set_zoom_rect((offset[0], offset[1], preview.width, preview.height))
         except (OSError, ValueError, RuntimeError) as error:
             self.write_log(f"! Preview failed: {error}")
             self.preview_canvas.clear_preview(f"បញ្ហា Preview Screen:\n{error}")
@@ -1016,6 +1442,7 @@ class LogoAdderUltra(QMainWindow):
             self.themed_message_dialog("រកមិនឃើញរូបភាព", "មិនមានរូបភាពសម្រាប់ដំណើរការទេ។")
             return
         settings = self.current_config()
+        settings["photo_adjustments"] = {key: normalize_adjustments(value) for key, value in self.photo_adjustments.items()}
         output_settings = normalize_output_settings(settings.get("output"))
         conflict_count = self.count_output_conflicts(folder, files, output_settings)
         conflict_policy = "rename"
@@ -1026,7 +1453,7 @@ class LogoAdderUltra(QMainWindow):
                 return
         self.clear_log()
         self.progress.setValue(0)
-        self.count_label.setText(f"0 / {len(files)}")
+        self.count_label.setText(to_khmer_digits(f"0 / {len(files)}"))
         self.status_label.setText("កំពុងចាប់ផ្តើមដំណើរការ......")
         self.btn_open_folder.setEnabled(False)
         self.cancel_requested.clear()
@@ -1055,7 +1482,7 @@ class LogoAdderUltra(QMainWindow):
         title = QLabel("រូបភាពមានរួចហើយ")
         title.setObjectName("dialogTitle")
         title.setAlignment(Qt.AlignCenter)
-        body = QLabel(f"រកឃើញ {conflict_count} រូបភាពដែលអាចមានឈ្មោះជាន់គ្នា។\nជម្រើសសុវត្ថិភាពគឺប្តូរឈ្មោះថ្មី ដើម្បីមិនលុបលទ្ធផលចាស់។")
+        body = QLabel(f"រកឃើញ {to_khmer_digits(conflict_count)} រូបភាពដែលអាចមានឈ្មោះជាន់គ្នា។\nជម្រើសសុវត្ថិភាពគឺប្តូរឈ្មោះថ្មី ដើម្បីមិនលុបលទ្ធផលចាស់។")
         body.setObjectName("hintLabel")
         body.setWordWrap(True)
         body.setAlignment(Qt.AlignCenter)
@@ -1107,13 +1534,13 @@ class LogoAdderUltra(QMainWindow):
                 if kind == "progress":
                     _, index, total, filename = message
                     self.progress.setValue(int(index / total * 1000))
-                    self.count_label.setText(f"{index} / {total}")
+                    self.count_label.setText(to_khmer_digits(f"{index} / {total}"))
                     remaining = max(total - index, 0)
                     eta_text = ""
                     if self.processing_started_at and index:
                         elapsed = max(time.monotonic() - self.processing_started_at, 0.1)
                         seconds_left = int((elapsed / index) * remaining)
-                        eta_text = f" | នៅសល់ {remaining} | ~{seconds_left}s"
+                        eta_text = f" | នៅសល់ {to_khmer_digits(remaining)} | ~{to_khmer_digits(seconds_left)}s"
                     self.status_label.setText(f"កំពុងដំណើរការ: {filename}{eta_text}")
                     self.write_log(f"> {filename}")
                 elif kind == "error":
@@ -1142,8 +1569,8 @@ class LogoAdderUltra(QMainWindow):
         self.set_processing_state(False)
         self.btn_open_folder.setEnabled(bool(output_dir))
         status = "បានបោះបង់" if cancelled else "រួចរាល់"
-        self.status_label.setText(f"{status}: ជោគជ័យ {successes}, បរាជ័យ {len(errors)}")
-        self.write_log(f"> {status}: ជោគជ័យ {successes}, បរាជ័យ {len(errors)}")
+        self.status_label.setText(f"{status}: ជោគជ័យ {to_khmer_digits(successes)}, បរាជ័យ {to_khmer_digits(len(errors))}")
+        self.write_log(f"> {status}: ជោគជ័យ {to_khmer_digits(successes)}, បរាជ័យ {to_khmer_digits(len(errors))}")
         if errors:
             self.write_log("> បានរក្សាទុកសេចក្តីសង្ខេបបញ្ហាទៅ failed_files.txt")
         self.show_finish_dialog(status, successes, len(errors), output_dir)
@@ -1166,10 +1593,10 @@ class LogoAdderUltra(QMainWindow):
 
         summary_row = QHBoxLayout()
         summary_row.setSpacing(18)
-        success_label = QLabel(f"ជោគជ័យ {successes}")
+        success_label = QLabel(f"ជោគជ័យ {to_khmer_digits(successes)}")
         success_label.setObjectName("successText")
         success_label.setAlignment(Qt.AlignCenter)
-        failure_label = QLabel(f"បរាជ័យ {failures}")
+        failure_label = QLabel(f"បរាជ័យ {to_khmer_digits(failures)}")
         failure_label.setObjectName("failureText")
         failure_label.setAlignment(Qt.AlignCenter)
         summary_row.addWidget(success_label)

@@ -9,6 +9,7 @@ APP_TITLE = "កម្មវិធីដាក់Logoលើរូបភាព - 
 TITLE_LOGO_FILE = "Title Logo.png"
 TITLE_FONT_FILE = "KhmerOSmuollight.ttf"
 NORMAL_FONT_FILE = "KhmerOSsiemreap.ttf"
+CREATOR_FONT_FILE = "brown cheese.otf"
 WINDOW_SIZE = (1260, 900)
 WINDOW_SCREEN_MARGIN = 32
 COMPACT_WINDOW_WIDTH = 1120
@@ -37,9 +38,11 @@ THEME = {
 
 NORMAL_FONT_FAMILY = "Khmer OS Siemreap"
 TITLE_FONT_FAMILY = "Khmer OS Muol Light"
+CREATOR_FONT_FAMILY = "Brown Cheese"
 LATIN_FONT_FAMILY = "Comic Sans MS"
 FONT_STACK = f'"{LATIN_FONT_FAMILY}", "{NORMAL_FONT_FAMILY}", "Noto Sans Khmer", "Khmer OS Battambang", "Leelawadee UI", "Segoe UI", "Roboto", "Arial"'
 TITLE_FONT_STACK = f'"{TITLE_FONT_FAMILY}", "{LATIN_FONT_FAMILY}", "{NORMAL_FONT_FAMILY}", "Noto Sans Khmer", "Khmer OS Muol Light", "Arial"'
+CREATOR_FONT_STACK = f'"{CREATOR_FONT_FAMILY}", "{LATIN_FONT_FAMILY}", "{NORMAL_FONT_FAMILY}", "Arial"'
 
 SITE_STYLE = {
     "bg": "#09090b",
@@ -65,11 +68,13 @@ def register_app_font(filename, fallback_family):
 
 
 def load_app_fonts():
-    global NORMAL_FONT_FAMILY, TITLE_FONT_FAMILY, FONT_STACK, TITLE_FONT_STACK
+    global NORMAL_FONT_FAMILY, TITLE_FONT_FAMILY, CREATOR_FONT_FAMILY, FONT_STACK, TITLE_FONT_STACK, CREATOR_FONT_STACK
     NORMAL_FONT_FAMILY = register_app_font(NORMAL_FONT_FILE, NORMAL_FONT_FAMILY)
     TITLE_FONT_FAMILY = register_app_font(TITLE_FONT_FILE, TITLE_FONT_FAMILY)
+    CREATOR_FONT_FAMILY = register_app_font(CREATOR_FONT_FILE, CREATOR_FONT_FAMILY)
     FONT_STACK = f'"{LATIN_FONT_FAMILY}", "{NORMAL_FONT_FAMILY}", "Noto Sans Khmer", "Khmer OS Battambang", "Leelawadee UI", "Segoe UI", "Roboto", "Arial"'
     TITLE_FONT_STACK = f'"{TITLE_FONT_FAMILY}", "{LATIN_FONT_FAMILY}", "{NORMAL_FONT_FAMILY}", "Noto Sans Khmer", "Khmer OS Muol Light", "Arial"'
+    CREATOR_FONT_STACK = f'"{CREATOR_FONT_FAMILY}", "{LATIN_FONT_FAMILY}", "{NORMAL_FONT_FAMILY}", "Arial"'
 
 
 def make_font(size, bold=False, family=None):
@@ -170,7 +175,8 @@ def material_qss():
         font-weight: 400;
     }}
     QLabel#creatorLabel {{
-        font-size: 27px;
+        font-size: 35px;
+        font-family: {CREATOR_FONT_STACK};
         letter-spacing: 1px;
     }}
     QScrollArea#sidebarScroll {{
@@ -251,6 +257,13 @@ def material_qss():
         min-height: 46px;
         font-size: 15px;
         border-radius: 14px;
+        color: #ffffff;
+    }}
+    QPushButton#startProcessButton[variant="success"],
+    QPushButton#startProcessButton[variant="success"]:hover,
+    QPushButton#startProcessButton[variant="success"]:focus,
+    QPushButton#startProcessButton[variant="success"]:pressed {{
+        color: #ffffff;
     }}
     QPushButton#openResultButton {{
         min-height: 42px;
@@ -268,6 +281,73 @@ def material_qss():
         padding: 6px 10px;
         font-size: 12px;
     }}
+    QPushButton[smallAction="true"] {{
+        min-height: 30px;
+        max-height: 32px;
+        border-radius: 10px;
+        padding: 4px 12px;
+        font-size: 12px;
+    }}
+    QPushButton[iconButton="true"] {{
+        min-width: 38px;
+        max-width: 38px;
+        min-height: 36px;
+        max-height: 36px;
+        border-radius: 10px;
+        padding: 4px;
+        font-size: 18px;
+    }}
+    QPushButton[wideDialogButton="true"] {{
+        min-height: 42px;
+        max-height: 44px;
+        border-radius: 12px;
+        padding: 7px 14px;
+        font-size: 14px;
+    }}
+    QPushButton[qualityOption="true"] {{
+        min-height: 34px;
+        border-radius: 10px;
+        padding: 5px 8px;
+        font-size: 12px;
+        background: {THEME["panel_soft"]};
+        color: {THEME["text"]};
+    }}
+    QPushButton[qualityOption="true"][selected="true"] {{
+        background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1ec8ff, stop:1 #35d898);
+        color: #ffffff;
+    }}
+    QCheckBox#sourceNameCheck {{
+        color: {THEME["text"]};
+        font-size: 14px;
+        spacing: 8px;
+    }}
+    QRadioButton#sourceNameCheck {{
+        color: {THEME["text"]};
+        font-size: 13px;
+        spacing: 8px;
+    }}
+    QCheckBox#sourceNameCheck::indicator {{
+        width: 18px;
+        height: 18px;
+        border-radius: 5px;
+        border: 1px solid rgba(71, 220, 255, 0.45);
+        background: rgba(6, 21, 44, 0.86);
+    }}
+    QCheckBox#sourceNameCheck::indicator:checked {{
+        background: {THEME["success"]};
+        border: 1px solid {THEME["cyan"]};
+    }}
+    QRadioButton#sourceNameCheck::indicator {{
+        width: 16px;
+        height: 16px;
+        border-radius: 8px;
+        border: 1px solid rgba(71, 220, 255, 0.45);
+        background: rgba(6, 21, 44, 0.86);
+    }}
+    QRadioButton#sourceNameCheck::indicator:checked {{
+        background: {THEME["success"]};
+        border: 2px solid {THEME["cyan"]};
+    }}
     QLineEdit {{
         min-height: 34px;
         border-radius: 10px;
@@ -282,6 +362,11 @@ def material_qss():
     }}
     QLineEdit[error="true"] {{
         border: 1px solid {THEME["danger"]};
+    }}
+    QLineEdit#textEntry:disabled, QLineEdit[sourceNameDisabled="true"] {{
+        background: rgba(16, 47, 86, 0.42);
+        border: 1px dashed rgba(71, 220, 255, 0.25);
+        color: {THEME["muted"]};
     }}
     QLineEdit#numberEntry {{
         qproperty-alignment: AlignCenter;

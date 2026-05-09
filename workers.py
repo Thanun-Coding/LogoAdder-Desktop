@@ -24,6 +24,8 @@ def run_processing_worker(folder, logo_path, files, settings, conflict_policy, p
     errors = []
     successes = 0
     output_settings = normalize_output_settings(settings.get("output"))
+    global_adjustments = settings.get("adjustments", {})
+    photo_adjustments = settings.get("photo_adjustments", {})
     output_dir = Path(folder) / output_settings["folder_name"]
     output_dir.mkdir(exist_ok=True)
     margin_settings = {
@@ -68,6 +70,7 @@ def run_processing_worker(folder, logo_path, files, settings, conflict_policy, p
                     settings["position"],
                     settings["logo_size"],
                     settings["opacity"],
+                    photo_adjustments.get(filename, global_adjustments),
                 )
                 pending[executor.submit(process_logo_task, task)] = filename
                 next_index += 1

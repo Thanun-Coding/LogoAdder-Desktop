@@ -1,4 +1,4 @@
-from PySide6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QCursor, QFont, QLinearGradient, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QComboBox, QDialog, QLabel, QListView, QSlider, QSizePolicy, QStyle, QStyledItemDelegate, QWidget
 
@@ -167,6 +167,8 @@ class FriendlySlider(QSlider):
         if self.orientation() != Qt.Horizontal or self.width() <= 0:
             return super().mousePressEvent(event)
         if event.button() == Qt.LeftButton:
+            if self.property("wheelAdjust"):
+                self.setFocus(Qt.MouseFocusReason)
             self.setSliderDown(True)
             if self.is_on_handle(event.position().x()):
                 self.drag_offset = event.position().x() - self.handle_center_x()
@@ -194,6 +196,13 @@ class FriendlySlider(QSlider):
         super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event):
+        if self.property("wheelAdjust"):
+            delta = event.angleDelta().y() or event.pixelDelta().y()
+            if delta:
+                step = self.singleStep() or 1
+                self.setValue(self.value() + (step if delta > 0 else -step))
+                event.accept()
+                return
         event.ignore()
 
 
@@ -232,7 +241,7 @@ class LiveHeader(QWidget):
         painter.setPen(Qt.NoPen)
         painter.drawEllipse(8, 14 - radius // 2, radius * 2, radius * 2)
         painter.setPen(QColor(THEME["cyan"]))
-        painter.drawText(30, 25, "LIVE PREVIEW")
+        painter.drawText(30, 25, "មើលរូបផ្ទាល់")
 
 
 class PreviewLabel(QLabel):
@@ -245,6 +254,11 @@ class PreviewLabel(QLabel):
         self.hitboxes = {}
         self.source_pixmap = QPixmap()
         self.display_rect = QRect()
+        self.zoom_source_rect = QRect()
+        self.zoom_factor = 1.0
+        self.pan_offset = QPointF(0, 0)
+        self.is_panning = False
+        self.last_pan_pos = QPointF()
         self.setMouseTracking(True)
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumSize(640, 380)
@@ -257,22 +271,61 @@ class PreviewLabel(QLabel):
         self.setText("")
         self.refresh_scaled_pixmap()
 
+    def set_zoom_rect(self, rect):
+        x, y, width, height = rect
+        self.zoom_source_rect = QRect(int(x), int(y), int(width), int(height))
+
     def clear_preview(self, text):
         self.hitboxes = {}
         self.source_pixmap = QPixmap()
         self.display_rect = QRect()
+        self.zoom_source_rect = QRect()
+        self.reset_zoom()
         QLabel.setPixmap(self, QPixmap())
         self.setText(text)
+
+    def reset_zoom(self):
+        self.zoom_factor = 1.0
+        self.pan_offset = QPointF(0, 0)
+        self.is_panning = False
+        self.last_pan_pos = QPointF()
+
+    def is_zoomed(self):
+        return self.zoom_factor > 1.01
+
+    def clamp_pan(self, scaled_size):
+        available = self.contentsRect().size()
+        max_x = max(0.0, (scaled_size.width() - available.width()) / 2)
+        max_y = max(0.0, (scaled_size.height() - available.height()) / 2)
+        self.pan_offset.setX(max(-max_x, min(max_x, self.pan_offset.x())))
+        self.pan_offset.setY(max(-max_y, min(max_y, self.pan_offset.y())))
 
     def refresh_scaled_pixmap(self):
         if self.source_pixmap.isNull():
             return
         available = self.contentsRect().size()
-        scaled = self.source_pixmap.scaled(available, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        x = (self.width() - scaled.width()) // 2
-        y = (self.height() - scaled.height()) // 2
+        zoom_source = self.source_pixmap
+        if self.is_zoomed() and not self.zoom_source_rect.isNull():
+            zoom_source = self.source_pixmap.copy(self.zoom_source_rect)
+        fit = zoom_source.scaled(available, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        scaled_size = QSize(
+            max(1, int(round(fit.width() * self.zoom_factor))),
+            max(1, int(round(fit.height() * self.zoom_factor))),
+        )
+        if not self.is_zoomed():
+            self.pan_offset = QPointF(0, 0)
+        self.clamp_pan(scaled_size)
+        scaled = zoom_source.scaled(scaled_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        canvas = QPixmap(available)
+        canvas.fill(Qt.transparent)
+        x = (available.width() - scaled.width()) // 2 + int(round(self.pan_offset.x()))
+        y = (available.height() - scaled.height()) // 2 + int(round(self.pan_offset.y()))
+        painter = QPainter(canvas)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.drawPixmap(x, y, scaled)
+        painter.end()
         self.display_rect = QRect(x, y, scaled.width(), scaled.height())
-        QLabel.setPixmap(self, scaled)
+        QLabel.setPixmap(self, canvas)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -290,6 +343,8 @@ class PreviewLabel(QLabel):
         return local_x * scale_x, local_y * scale_y
 
     def action_at(self, x, y):
+        if self.is_zoomed():
+            return ""
         for action, rect in self.hitboxes.items():
             x1, y1, x2, y2 = rect
             if x1 <= x <= x2 and y1 <= y <= y2:
@@ -300,13 +355,57 @@ class PreviewLabel(QLabel):
         action = self.action_at(*self.event_position(event))
         if action:
             self.clicked.emit(action)
+            return
+        if self.is_zoomed() and self.event_position(event) != (-1, -1):
+            self.is_panning = True
+            self.last_pan_pos = event.position()
+            self.setCursor(QCursor(Qt.ClosedHandCursor))
 
     def mouseMoveEvent(self, event):
+        if self.is_panning:
+            delta = event.position() - self.last_pan_pos
+            self.pan_offset += delta
+            self.last_pan_pos = event.position()
+            self.refresh_scaled_pixmap()
+            return
         action = self.action_at(*self.event_position(event))
         self.setCursor(QCursor(Qt.PointingHandCursor if action else Qt.ArrowCursor))
         self.hovered.emit(action)
 
+    def mouseReleaseEvent(self, event):
+        self.is_panning = False
+        self.setCursor(QCursor(Qt.ArrowCursor))
+
+    def wheelEvent(self, event):
+        pixel_delta = event.pixelDelta()
+        angle_delta = event.angleDelta()
+        zoom_delta = pixel_delta.y() if not pixel_delta.isNull() else angle_delta.y()
+        if zoom_delta == 0 and pixel_delta.x() == 0 and angle_delta.x() == 0:
+            event.ignore()
+            return
+        if event.modifiers() & Qt.ControlModifier:
+            factor = 1.15 if zoom_delta > 0 else 1 / 1.15
+            self.zoom_factor = max(1.0, min(4.0, self.zoom_factor * factor))
+            if not self.is_zoomed():
+                self.pan_offset = QPointF(0, 0)
+            self.refresh_scaled_pixmap()
+            event.accept()
+            return
+        if self.is_zoomed():
+            if not pixel_delta.isNull():
+                pan_delta = QPointF(pixel_delta.x(), pixel_delta.y())
+            else:
+                pan_delta = QPointF(angle_delta.x() / 2, angle_delta.y() / 2)
+                if event.modifiers() & Qt.ShiftModifier and angle_delta.x() == 0:
+                    pan_delta = QPointF(angle_delta.y() / 2, 0)
+            self.pan_offset += pan_delta
+            self.refresh_scaled_pixmap()
+            event.accept()
+            return
+        event.ignore()
+
     def leaveEvent(self, event):
+        self.is_panning = False
         self.setCursor(QCursor(Qt.ArrowCursor))
         self.left.emit()
 

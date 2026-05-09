@@ -19,12 +19,17 @@ Remove-Item -LiteralPath (Join-Path $distRoot $appName) -Recurse -Force -ErrorAc
   --onefile `
   --windowed `
   --name $appName `
-  --icon "assets\myicon.ico" `
-  --add-data "assets\myicon.ico;assets" `
+  --icon "assets\applogo.ico" `
+  --add-data "assets\applogo.ico;assets" `
   --add-data "assets\Title Logo.png;assets" `
   --add-data "assets\KhmerOSmuollight.ttf;assets" `
   --add-data "assets\KhmerOSsiemreap.ttf;assets" `
+  --add-data "assets\brown cheese.otf;assets" `
+  --add-data "assets\arrows-clockwise.svg;assets" `
+  --add-data "assets\flip-vertical.svg;assets" `
+  --add-data "assets\flip-horizontal.svg;assets" `
   --hidden-import "PySide6" `
+  --hidden-import "pillow_heif" `
   --exclude-module "qt_material" `
   --exclude-module "PyQt6" `
   --exclude-module "PyQt5" `

@@ -5,8 +5,8 @@ a = Analysis(
     ['LogoAdder.py'],
     pathex=[],
     binaries=[],
-    datas=[('assets\\myicon.ico', 'assets'), ('assets\\Title Logo.png', 'assets'), ('assets\\KhmerOSmuollight.ttf', 'assets'), ('assets\\KhmerOSsiemreap.ttf', 'assets')],
-    hiddenimports=['PySide6'],
+    datas=[('assets\\applogo.ico', 'assets'), ('assets\\Title Logo.png', 'assets'), ('assets\\KhmerOSmuollight.ttf', 'assets'), ('assets\\KhmerOSsiemreap.ttf', 'assets'), ('assets\\brown cheese.otf', 'assets'), ('assets\\arrows-clockwise.svg', 'assets'), ('assets\\flip-vertical.svg', 'assets'), ('assets\\flip-horizontal.svg', 'assets')],
+    hiddenimports=['PySide6', 'pillow_heif'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -35,5 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['assets\\myicon.ico'],
+    icon=['assets\\applogo.ico'],
 )
