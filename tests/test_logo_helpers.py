@@ -8,6 +8,7 @@ from logo_core import (
     DEFAULT_OUTPUT_SETTINGS,
     KHMER_POSITIONS,
     apply_photo_adjustments,
+    apply_photo_crop,
     auto_adjust_image,
     build_error_summary,
     build_output_path,
@@ -22,12 +23,15 @@ from logo_core import (
     is_supported_image,
     initialize_logo_worker,
     normalize_adjustments,
+    normalize_crop,
     normalize_output_settings,
     normalize_selected_image_paths,
     nearest_quality_preset,
     preset_from_settings,
     open_rgba_image,
     process_logo_task,
+    crop_box_for_image,
+    crop_settings_from_box,
     sanitize_path_part,
     save_config,
     save_output_image,
@@ -237,6 +241,74 @@ class LogoHelperTests(unittest.TestCase):
         self.assertEqual(settings["auto"], 0)
         self.assertEqual(settings["rotation"], 0)
 
+    def test_auto_adjust_brightens_dark_photo(self):
+        from PIL import Image, ImageStat
+
+        image = Image.new("RGBA", (16, 16), (42, 48, 55, 255))
+        result = auto_adjust_image(image)
+
+        before = ImageStat.Stat(image.convert("L")).mean[0]
+        after = ImageStat.Stat(result.convert("L")).mean[0]
+        settings = estimate_auto_adjustments(image)
+        self.assertGreater(after, before + 12)
+        self.assertGreater(settings["brightness"], 10)
+
+    def test_auto_adjust_protects_bright_photo_highlights(self):
+        from PIL import Image, ImageStat
+
+        image = Image.new("RGBA", (16, 16), (238, 232, 222, 255))
+        result = auto_adjust_image(image)
+
+        after = ImageStat.Stat(result.convert("L")).mean[0]
+        settings = estimate_auto_adjustments(image)
+        self.assertLessEqual(after, 245)
+        self.assertLess(settings["highlight"], 0)
+
+    def test_auto_adjust_adds_contrast_to_flat_photo(self):
+        from PIL import Image, ImageStat
+
+        image = Image.new("RGBA", (32, 1))
+        for x in range(32):
+            value = 112 + (x % 5)
+            image.putpixel((x, 0), (value, value, value, 255))
+        result = auto_adjust_image(image)
+
+        before = ImageStat.Stat(image.convert("L")).stddev[0]
+        after = ImageStat.Stat(result.convert("L")).stddev[0]
+        settings = estimate_auto_adjustments(image)
+        self.assertGreater(after, before)
+        self.assertGreater(settings["contrast"], 10)
+
+    def test_auto_adjust_warms_cool_color_cast(self):
+        from PIL import Image
+
+        image = Image.new("RGBA", (16, 16), (80, 105, 165, 255))
+        settings = estimate_auto_adjustments(image)
+
+        self.assertGreater(settings["warmth"], 8)
+
+    def test_crop_settings_are_clamped_and_keep_visible_area(self):
+        crop = normalize_crop({"left": 80, "right": 80, "top": -10, "bottom": "bad"})
+
+        self.assertEqual(crop["left"], 80)
+        self.assertEqual(crop["right"], 18)
+        self.assertEqual(crop["top"], 0)
+        self.assertEqual(crop["bottom"], 0)
+
+    def test_crop_box_uses_percent_edges(self):
+        self.assertEqual(crop_box_for_image((200, 100), {"left": 10, "top": 20, "right": 30, "bottom": 10}), (20, 20, 140, 90))
+
+    def test_crop_settings_from_box_uses_percent_edges(self):
+        self.assertEqual(crop_settings_from_box((200, 100), (20, 20, 140, 90)), {"left": 10, "top": 20, "right": 30, "bottom": 10})
+
+    def test_apply_photo_crop_changes_dimensions(self):
+        from PIL import Image
+
+        image = Image.new("RGBA", (100, 80), "white")
+        result = apply_photo_crop(image, {"left": 10, "top": 25, "right": 20, "bottom": 25})
+
+        self.assertEqual(result.size, (70, 40))
+
     def test_output_path_uses_suffix_and_selected_format(self):
         settings = normalize_output_settings({"format": "PNG", "name_prefix": "EOA", "folder_name": "Export"})
 
@@ -278,6 +350,34 @@ class LogoHelperTests(unittest.TestCase):
 
             self.assertEqual(result[:3], ("success", 1, "photo.png"))
             self.assertTrue((folder / "Outputs" / "EOA-1.png").exists())
+
+    def test_process_logo_task_applies_crop_before_output(self):
+        with TemporaryDirectory() as temp_dir:
+            from PIL import Image
+
+            folder = Path(temp_dir)
+            Image.new("RGB", (100, 80), "white").save(folder / "photo.png")
+            logo = Image.new("RGBA", (1, 1), (255, 0, 0, 0))
+            initialize_logo_worker((logo.size, logo.tobytes("raw", "RGBA")))
+
+            process_logo_task(
+                (
+                    str(folder),
+                    "photo.png",
+                    1,
+                    DEFAULT_OUTPUT_SETTINGS,
+                    "overwrite",
+                    {"top": 0, "bottom": 0, "left": 0, "right": 0},
+                    KHMER_POSITIONS["top_left"],
+                    10,
+                    1.0,
+                    {},
+                    {"left": 10, "top": 25, "right": 20, "bottom": 25},
+                )
+            )
+
+            with Image.open(folder / "Outputs" / "EOA-1.png") as output:
+                self.assertEqual(output.size, (70, 40))
 
     def test_output_path_keeps_original_extension_when_format_is_same(self):
         result = build_output_path("C:/Images", "photo.JPEG", DEFAULT_OUTPUT_SETTINGS, 3)

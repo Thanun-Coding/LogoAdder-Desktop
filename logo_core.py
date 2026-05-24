@@ -50,6 +50,13 @@ ADJUSTMENT_RANGES = {
     "flip_vertical": (0, 1),
     "auto": (0, 1),
 }
+DEFAULT_CROP = {
+    "left": 0,
+    "top": 0,
+    "right": 0,
+    "bottom": 0,
+}
+CROP_KEYS = tuple(DEFAULT_CROP.keys())
 ROTATION_VALUES = (0, 90, 180, 270)
 WINDOWS_RESERVED_NAMES = {
     "CON",
@@ -286,6 +293,78 @@ def normalize_adjustments(settings):
     return normalized
 
 
+def normalize_crop(settings):
+    settings = settings if isinstance(settings, dict) else {}
+    normalized = {}
+    for key, default in DEFAULT_CROP.items():
+        try:
+            value = int(settings.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        normalized[key] = int(clamp(value, 0, 95))
+
+    horizontal = normalized["left"] + normalized["right"]
+    if horizontal >= 99:
+        overflow = horizontal - 98
+        if normalized["right"] >= overflow:
+            normalized["right"] -= overflow
+        else:
+            overflow -= normalized["right"]
+            normalized["right"] = 0
+            normalized["left"] = max(0, normalized["left"] - overflow)
+
+    vertical = normalized["top"] + normalized["bottom"]
+    if vertical >= 99:
+        overflow = vertical - 98
+        if normalized["bottom"] >= overflow:
+            normalized["bottom"] -= overflow
+        else:
+            overflow -= normalized["bottom"]
+            normalized["bottom"] = 0
+            normalized["top"] = max(0, normalized["top"] - overflow)
+    return normalized
+
+
+def crop_box_for_image(image_size, crop_settings):
+    width, height = image_size
+    if width <= 0 or height <= 0:
+        raise ValueError("image dimensions must be greater than zero")
+    crop = normalize_crop(crop_settings)
+    left = int(round(width * crop["left"] / 100))
+    top = int(round(height * crop["top"] / 100))
+    right = width - int(round(width * crop["right"] / 100))
+    bottom = height - int(round(height * crop["bottom"] / 100))
+    right = max(left + 1, min(width, right))
+    bottom = max(top + 1, min(height, bottom))
+    return left, top, right, bottom
+
+
+def crop_settings_from_box(image_size, box):
+    width, height = image_size
+    if width <= 0 or height <= 0:
+        raise ValueError("image dimensions must be greater than zero")
+    left, top, right, bottom = box
+    left = clamp(int(round(left)), 0, width - 1)
+    top = clamp(int(round(top)), 0, height - 1)
+    right = clamp(int(round(right)), left + 1, width)
+    bottom = clamp(int(round(bottom)), top + 1, height)
+    return normalize_crop(
+        {
+            "left": round(left / width * 100),
+            "top": round(top / height * 100),
+            "right": round((width - right) / width * 100),
+            "bottom": round((height - bottom) / height * 100),
+        }
+    )
+
+
+def apply_photo_crop(image, crop_settings):
+    crop = normalize_crop(crop_settings)
+    if crop == DEFAULT_CROP:
+        return image
+    return image.crop(crop_box_for_image(image.size, crop))
+
+
 def adjustment_factor(value):
     return max(0.0, 1.0 + (float(value) / 100.0))
 
@@ -335,17 +414,148 @@ def apply_warmth_adjustment(image, value):
     return adjusted
 
 
+def luminance_metrics(image):
+    require_pillow()
+    gray = image.convert("L")
+    histogram = gray.histogram()
+    total = sum(histogram) or 1
+
+    def percentile(target):
+        threshold = total * target
+        running = 0
+        for value, count in enumerate(histogram):
+            running += count
+            if running >= threshold:
+                return value
+        return 255
+
+    stat = ImageStat.Stat(gray)
+    mean = stat.mean[0] if stat.mean else 128
+    stddev = stat.stddev[0] if stat.stddev else 0
+    return {
+        "mean": mean,
+        "stddev": stddev,
+        "p01": percentile(0.01),
+        "p05": percentile(0.05),
+        "p50": percentile(0.50),
+        "p95": percentile(0.95),
+        "p99": percentile(0.99),
+    }
+
+
+def channel_means(image):
+    stat = ImageStat.Stat(image.convert("RGB"))
+    means = stat.mean if stat.mean else (128, 128, 128)
+    return means[0], means[1], means[2]
+
+
+def apply_gray_world_balance(image, strength=0.55):
+    alpha = image.getchannel("A") if image.mode == "RGBA" else None
+    rgb = image.convert("RGB")
+    means = channel_means(rgb)
+    gray = sum(means) / 3.0
+    if gray <= 1:
+        return image
+    channels = []
+    for channel, mean in zip(rgb.split(), means):
+        target_factor = gray / max(mean, 1)
+        factor = 1.0 + ((target_factor - 1.0) * strength)
+        factor = clamp(factor, 0.82, 1.18)
+        channels.append(channel.point(lambda p, f=factor: int(clamp(p * f, 0, 255))))
+    balanced = Image.merge("RGB", channels).convert("RGBA")
+    if alpha is not None:
+        balanced.putalpha(alpha)
+    return balanced
+
+
+def lift_shadows(image, value):
+    value = int(clamp(value, 0, 100))
+    if value == 0:
+        return image
+    alpha = image.getchannel("A") if image.mode == "RGBA" else None
+    rgb = image.convert("RGB")
+    amount = value / 100.0
+
+    def adjust(pixel):
+        if pixel >= 150:
+            return pixel
+        strength = (150 - pixel) / 150.0
+        return int(clamp(pixel + (42 * amount * strength), 0, 255))
+
+    lifted = rgb.point(adjust).convert("RGBA")
+    if alpha is not None:
+        lifted.putalpha(alpha)
+    return lifted
+
+
+def auto_adjustment_plan(image):
+    rgb = image.convert("RGB")
+    metrics = luminance_metrics(rgb)
+    red_mean, green_mean, blue_mean = channel_means(rgb)
+    dynamic_range = metrics["p95"] - metrics["p05"]
+    highlight_headroom = 245 - metrics["p99"]
+    shadow_depth = metrics["p05"]
+    color_cast = max(red_mean, green_mean, blue_mean) - min(red_mean, green_mean, blue_mean)
+
+    brightness = int(clamp((132 - metrics["mean"]) * 0.42 + (118 - metrics["p50"]) * 0.18, -32, 34))
+    if metrics["p99"] > 246 and brightness > 0:
+        brightness = min(brightness, 8)
+    if metrics["p05"] < 18 and metrics["mean"] < 105:
+        brightness = max(brightness, 10)
+
+    contrast = int(clamp((92 - dynamic_range) * 0.34 + (46 - metrics["stddev"]) * 0.22, -10, 34))
+    if dynamic_range > 185:
+        contrast = int(clamp(contrast - 8, -16, 20))
+
+    highlight = 0
+    if metrics["p99"] > 236:
+        highlight = int(clamp(-(metrics["p99"] - 232) * 0.75, -34, 0))
+    elif metrics["mean"] > 218:
+        highlight = int(clamp(-(metrics["mean"] - 210) * 0.35, -20, 0))
+    elif highlight_headroom > 35 and metrics["mean"] < 125:
+        highlight = int(clamp(highlight_headroom * 0.10, 0, 10))
+
+    shadow_lift = int(clamp((42 - shadow_depth) * 0.45 if metrics["mean"] < 145 else 0, 0, 22))
+
+    saturation = int(clamp(16 - (color_cast * 0.05), 6, 18))
+    if metrics["stddev"] < 24:
+        saturation = min(14, saturation)
+
+    sharpness = int(clamp(16 + (32 - metrics["stddev"]) * 0.10, 10, 22))
+    warmth = int(clamp((blue_mean - red_mean) * 0.20 + (green_mean - ((red_mean + blue_mean) / 2)) * 0.06, -18, 18))
+
+    return {
+        "metrics": metrics,
+        "brightness": brightness,
+        "contrast": contrast,
+        "highlight": highlight,
+        "shadow_lift": shadow_lift,
+        "saturation": saturation,
+        "sharpness": sharpness,
+        "warmth": warmth,
+    }
+
+
 def auto_adjust_image(image):
     require_pillow()
     alpha = image.getchannel("A") if image.mode == "RGBA" else None
-    rgb = ImageOps.autocontrast(image.convert("RGB"), cutoff=1)
-    stat = ImageStat.Stat(rgb.convert("L"))
-    mean = stat.mean[0] if stat.mean else 128
-    brightness_factor = clamp(128 / max(mean, 1), 0.82, 1.18)
-    rgb = ImageEnhance.Brightness(rgb).enhance(brightness_factor)
-    rgb = ImageEnhance.Contrast(rgb).enhance(1.08)
-    rgb = ImageEnhance.Color(rgb).enhance(1.06)
-    rgb = ImageEnhance.Sharpness(rgb).enhance(1.08)
+    plan = auto_adjustment_plan(image)
+    rgb = ImageOps.autocontrast(image.convert("RGB"), cutoff=0.35, preserve_tone=True).convert("RGBA")
+    rgb = apply_gray_world_balance(rgb, strength=0.50)
+    if plan["shadow_lift"]:
+        rgb = lift_shadows(rgb, plan["shadow_lift"])
+    if plan["brightness"]:
+        rgb = ImageEnhance.Brightness(rgb).enhance(adjustment_factor(plan["brightness"]))
+    if plan["highlight"]:
+        rgb = apply_highlight_adjustment(rgb, plan["highlight"])
+    if plan["contrast"]:
+        rgb = ImageEnhance.Contrast(rgb).enhance(adjustment_factor(plan["contrast"]))
+    if plan["saturation"]:
+        rgb = ImageEnhance.Color(rgb).enhance(adjustment_factor(plan["saturation"]))
+    if plan["warmth"]:
+        rgb = apply_warmth_adjustment(rgb, plan["warmth"])
+    if plan["sharpness"]:
+        rgb = ImageEnhance.Sharpness(rgb).enhance(1.0 + (plan["sharpness"] / 100.0))
     adjusted = rgb.convert("RGBA")
     if alpha is not None:
         adjusted.putalpha(alpha)
@@ -354,29 +564,16 @@ def auto_adjust_image(image):
 
 def estimate_auto_adjustments(image):
     require_pillow()
-    rgb = image.convert("RGB")
-    gray_stat = ImageStat.Stat(rgb.convert("L"))
-    mean = gray_stat.mean[0] if gray_stat.mean else 128
-    stddev = gray_stat.stddev[0] if gray_stat.stddev else 48
-    color_stat = ImageStat.Stat(rgb)
-    channels = color_stat.mean if color_stat.mean else (128, 128, 128)
-    color_spread = max(channels) - min(channels)
-
-    brightness = int(clamp((128 - mean) * 0.45, -25, 25))
-    highlight = int(clamp((210 - mean) * -0.18 if mean > 175 else 0, -18, 0))
-    contrast = int(clamp((58 - stddev) * 0.7, -8, 28))
-    saturation = int(clamp(12 - color_spread * 0.08, 0, 18))
-    sharpness = 12
-    warmth = int(clamp((channels[2] - channels[0]) * 0.18, -12, 12))
+    plan = auto_adjustment_plan(image)
 
     return normalize_adjustments(
         {
-            "brightness": brightness,
-            "highlight": highlight,
-            "contrast": contrast,
-            "saturation": saturation,
-            "sharpness": sharpness,
-            "warmth": warmth,
+            "brightness": plan["brightness"],
+            "highlight": plan["highlight"],
+            "contrast": plan["contrast"],
+            "saturation": plan["saturation"],
+            "sharpness": plan["sharpness"],
+            "warmth": plan["warmth"],
         }
     )
 
@@ -606,12 +803,14 @@ def process_logo_task(task):
         raise RuntimeError("Logo asset was not initialized in the worker process")
     folder, filename, index, output_settings, conflict_policy, margin_settings, position, logo_size, opacity, *extra = task
     adjustment_settings = extra[0] if extra else ADJUSTMENT_DEFAULTS
+    crop_settings = extra[1] if len(extra) > 1 else DEFAULT_CROP
     input_path = Path(folder) / filename
     output_path = build_output_path(folder, filename, output_settings, index)
     if conflict_policy == "rename":
         output_path = unique_output_path(output_path)
     output_path.parent.mkdir(exist_ok=True)
     base = open_rgba_image(input_path)
+    base = apply_photo_crop(base, crop_settings)
     base = apply_photo_adjustments(base, adjustment_settings)
     preview_size = contained_preview_size(base.size)
     margins = scale_margins(margin_settings, base.size, preview_size)

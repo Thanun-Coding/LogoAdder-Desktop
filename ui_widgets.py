@@ -2,7 +2,7 @@ from PySide6.QtCore import QEasingCurve, QPoint, QPointF, QPropertyAnimation, QR
 from PySide6.QtGui import QColor, QCursor, QFont, QLinearGradient, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QComboBox, QDialog, QLabel, QListView, QSlider, QSizePolicy, QStyle, QStyledItemDelegate, QWidget
 
-from logo_core import is_dialog_confirm_key, slider_position_from_value, slider_value_from_position
+from logo_core import crop_settings_from_box, is_dialog_confirm_key, slider_position_from_value, slider_value_from_position
 from preview import ui_font
 from styles import SITE_STYLE, THEME, TITLE_FONT_FAMILY, make_font
 
@@ -248,6 +248,8 @@ class PreviewLabel(QLabel):
     clicked = Signal(str)
     hovered = Signal(str)
     left = Signal()
+    cropChangeStarted = Signal()
+    cropChanged = Signal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -259,6 +261,12 @@ class PreviewLabel(QLabel):
         self.pan_offset = QPointF(0, 0)
         self.is_panning = False
         self.last_pan_pos = QPointF()
+        self.crop_edit_enabled = False
+        self.crop_image_rect = QRect()
+        self.crop_rect = QRect()
+        self.crop_drag_action = ""
+        self.crop_drag_start_pos = QPointF()
+        self.crop_drag_start_rect = QRect()
         self.setMouseTracking(True)
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumSize(640, 380)
@@ -275,11 +283,49 @@ class PreviewLabel(QLabel):
         x, y, width, height = rect
         self.zoom_source_rect = QRect(int(x), int(y), int(width), int(height))
 
+    def set_crop_editor(self, enabled, image_rect=None, crop=None):
+        self.crop_edit_enabled = bool(enabled)
+        if image_rect:
+            x, y, width, height = image_rect
+            self.crop_image_rect = QRect(int(x), int(y), int(width), int(height))
+        else:
+            self.crop_image_rect = QRect()
+        self.crop_rect = self.crop_rect_from_settings(crop or {}) if self.crop_edit_enabled else QRect()
+        self.crop_drag_action = ""
+        self.refresh_scaled_pixmap()
+
+    def crop_rect_from_settings(self, crop):
+        if self.crop_image_rect.isNull():
+            return QRect()
+        left_pct = int(crop.get("left", 0))
+        top_pct = int(crop.get("top", 0))
+        right_pct = int(crop.get("right", 0))
+        bottom_pct = int(crop.get("bottom", 0))
+        x = self.crop_image_rect.x() + round(self.crop_image_rect.width() * left_pct / 100)
+        y = self.crop_image_rect.y() + round(self.crop_image_rect.height() * top_pct / 100)
+        right = self.crop_image_rect.right() + 1 - round(self.crop_image_rect.width() * right_pct / 100)
+        bottom = self.crop_image_rect.bottom() + 1 - round(self.crop_image_rect.height() * bottom_pct / 100)
+        return self.clamped_crop_rect(QRect(x, y, max(1, right - x), max(1, bottom - y)))
+
+    def crop_settings_from_rect(self, rect):
+        if self.crop_image_rect.isNull():
+            return {"left": 0, "top": 0, "right": 0, "bottom": 0}
+        return crop_settings_from_box(
+            (self.crop_image_rect.width(), self.crop_image_rect.height()),
+            (
+                rect.x() - self.crop_image_rect.x(),
+                rect.y() - self.crop_image_rect.y(),
+                rect.x() + rect.width() - self.crop_image_rect.x(),
+                rect.y() + rect.height() - self.crop_image_rect.y(),
+            ),
+        )
+
     def clear_preview(self, text):
         self.hitboxes = {}
         self.source_pixmap = QPixmap()
         self.display_rect = QRect()
         self.zoom_source_rect = QRect()
+        self.set_crop_editor(False)
         self.reset_zoom()
         QLabel.setPixmap(self, QPixmap())
         self.setText(text)
@@ -323,9 +369,43 @@ class PreviewLabel(QLabel):
         painter = QPainter(canvas)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
         painter.drawPixmap(x, y, scaled)
-        painter.end()
         self.display_rect = QRect(x, y, scaled.width(), scaled.height())
+        self.draw_crop_overlay(painter)
+        painter.end()
         QLabel.setPixmap(self, canvas)
+
+    def source_to_display_rect(self, source_rect):
+        if self.display_rect.isNull() or self.source_pixmap.isNull() or source_rect.isNull():
+            return QRect()
+        sx = self.display_rect.width() / max(1, self.source_pixmap.width())
+        sy = self.display_rect.height() / max(1, self.source_pixmap.height())
+        return QRect(
+            self.display_rect.x() + round(source_rect.x() * sx),
+            self.display_rect.y() + round(source_rect.y() * sy),
+            max(1, round(source_rect.width() * sx)),
+            max(1, round(source_rect.height() * sy)),
+        )
+
+    def draw_crop_overlay(self, painter):
+        if not self.crop_edit_enabled or self.is_zoomed() or self.crop_image_rect.isNull() or self.crop_rect.isNull():
+            return
+        image_rect = self.source_to_display_rect(self.crop_image_rect)
+        crop_rect = self.source_to_display_rect(self.crop_rect)
+        if image_rect.isNull() or crop_rect.isNull():
+            return
+        painter.save()
+        overlay = QColor(0, 0, 0, 125)
+        painter.fillRect(QRect(image_rect.left(), image_rect.top(), image_rect.width(), max(0, crop_rect.top() - image_rect.top())), overlay)
+        painter.fillRect(QRect(image_rect.left(), crop_rect.bottom() + 1, image_rect.width(), max(0, image_rect.bottom() - crop_rect.bottom())), overlay)
+        painter.fillRect(QRect(image_rect.left(), crop_rect.top(), max(0, crop_rect.left() - image_rect.left()), crop_rect.height()), overlay)
+        painter.fillRect(QRect(crop_rect.right() + 1, crop_rect.top(), max(0, image_rect.right() - crop_rect.right()), crop_rect.height()), overlay)
+        painter.setPen(QPen(QColor("#47dcff"), 2))
+        painter.drawRect(crop_rect)
+        painter.setBrush(QColor("#47dcff"))
+        painter.setPen(QPen(QColor("#06152d"), 1))
+        for handle in self.crop_handle_rects(crop_rect).values():
+            painter.drawRect(handle)
+        painter.restore()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -342,6 +422,135 @@ class PreviewLabel(QLabel):
         scale_y = self.source_pixmap.height() / max(1, self.display_rect.height())
         return local_x * scale_x, local_y * scale_y
 
+    def display_point_to_source(self, point):
+        if self.display_rect.isNull() or self.source_pixmap.isNull():
+            return QPointF(-1, -1)
+        if self.crop_edit_enabled and not self.crop_image_rect.isNull():
+            crop_display_rect = self.source_to_display_rect(self.crop_image_rect)
+            if not crop_display_rect.isNull():
+                local_x = point.x() - crop_display_rect.x()
+                local_y = point.y() - crop_display_rect.y()
+                scale_x = self.crop_image_rect.width() / max(1, crop_display_rect.width())
+                scale_y = self.crop_image_rect.height() / max(1, crop_display_rect.height())
+                return QPointF(self.crop_image_rect.x() + (local_x * scale_x), self.crop_image_rect.y() + (local_y * scale_y))
+        local_x = point.x() - self.display_rect.x()
+        local_y = point.y() - self.display_rect.y()
+        scale_x = self.source_pixmap.width() / max(1, self.display_rect.width())
+        scale_y = self.source_pixmap.height() / max(1, self.display_rect.height())
+        return QPointF(local_x * scale_x, local_y * scale_y)
+
+    def crop_handle_rects(self, display_crop_rect):
+        size = 14
+        half = size // 2
+        cx = display_crop_rect.center().x()
+        cy = display_crop_rect.center().y()
+        left = display_crop_rect.left()
+        right = display_crop_rect.right()
+        top = display_crop_rect.top()
+        bottom = display_crop_rect.bottom()
+        return {
+            "top_left": QRect(left - half, top - half, size, size),
+            "top": QRect(cx - half, top - half, size, size),
+            "top_right": QRect(right - half, top - half, size, size),
+            "right": QRect(right - half, cy - half, size, size),
+            "bottom_right": QRect(right - half, bottom - half, size, size),
+            "bottom": QRect(cx - half, bottom - half, size, size),
+            "bottom_left": QRect(left - half, bottom - half, size, size),
+            "left": QRect(left - half, cy - half, size, size),
+        }
+
+    def crop_action_at(self, point):
+        if not self.crop_edit_enabled or self.is_zoomed() or self.crop_rect.isNull():
+            return ""
+        display_crop = self.source_to_display_rect(self.crop_rect)
+        if display_crop.isNull():
+            return ""
+        for action, rect in self.crop_handle_rects(display_crop).items():
+            if rect.contains(point.toPoint()):
+                return action
+        hit = 8
+        point_i = point.toPoint()
+        expanded = display_crop.adjusted(-hit, -hit, hit, hit)
+        if expanded.contains(point_i):
+            near_left = abs(point.x() - display_crop.left()) <= hit
+            near_right = abs(point.x() - display_crop.right()) <= hit
+            near_top = abs(point.y() - display_crop.top()) <= hit
+            near_bottom = abs(point.y() - display_crop.bottom()) <= hit
+            if near_left and near_top:
+                return "top_left"
+            if near_right and near_top:
+                return "top_right"
+            if near_left and near_bottom:
+                return "bottom_left"
+            if near_right and near_bottom:
+                return "bottom_right"
+            if near_left:
+                return "left"
+            if near_right:
+                return "right"
+            if near_top:
+                return "top"
+            if near_bottom:
+                return "bottom"
+        if display_crop.contains(point.toPoint()):
+            return "move"
+        return ""
+
+    def crop_cursor_for_action(self, action):
+        return {
+            "move": Qt.SizeAllCursor,
+            "left": Qt.SizeHorCursor,
+            "right": Qt.SizeHorCursor,
+            "top": Qt.SizeVerCursor,
+            "bottom": Qt.SizeVerCursor,
+            "top_left": Qt.SizeFDiagCursor,
+            "bottom_right": Qt.SizeFDiagCursor,
+            "top_right": Qt.SizeBDiagCursor,
+            "bottom_left": Qt.SizeBDiagCursor,
+        }.get(action, Qt.ArrowCursor)
+
+    def clamped_crop_rect(self, rect):
+        if self.crop_image_rect.isNull():
+            return QRect()
+        min_size = 12
+        left = max(self.crop_image_rect.left(), min(rect.left(), self.crop_image_rect.right() - min_size + 1))
+        top = max(self.crop_image_rect.top(), min(rect.top(), self.crop_image_rect.bottom() - min_size + 1))
+        right = min(self.crop_image_rect.right() + 1, max(rect.left() + min_size, rect.left() + rect.width()))
+        bottom = min(self.crop_image_rect.bottom() + 1, max(rect.top() + min_size, rect.top() + rect.height()))
+        if right - left < min_size:
+            left = max(self.crop_image_rect.left(), right - min_size)
+        if bottom - top < min_size:
+            top = max(self.crop_image_rect.top(), bottom - min_size)
+        return QRect(left, top, right - left, bottom - top)
+
+    def adjusted_crop_rect(self, source_point):
+        rect = QRect(self.crop_drag_start_rect)
+        dx = round(source_point.x() - self.crop_drag_start_pos.x())
+        dy = round(source_point.y() - self.crop_drag_start_pos.y())
+        action = self.crop_drag_action
+        if action == "move":
+            moved = QRect(rect)
+            moved.translate(dx, dy)
+            if moved.left() < self.crop_image_rect.left():
+                moved.moveLeft(self.crop_image_rect.left())
+            if moved.top() < self.crop_image_rect.top():
+                moved.moveTop(self.crop_image_rect.top())
+            if moved.right() > self.crop_image_rect.right():
+                moved.moveRight(self.crop_image_rect.right())
+            if moved.bottom() > self.crop_image_rect.bottom():
+                moved.moveBottom(self.crop_image_rect.bottom())
+            return moved
+        left, top, right, bottom = rect.left(), rect.top(), rect.right() + 1, rect.bottom() + 1
+        if "left" in action:
+            left += dx
+        if "right" in action:
+            right += dx
+        if "top" in action:
+            top += dy
+        if "bottom" in action:
+            bottom += dy
+        return self.clamped_crop_rect(QRect(left, top, right - left, bottom - top))
+
     def action_at(self, x, y):
         if self.is_zoomed():
             return ""
@@ -352,6 +561,15 @@ class PreviewLabel(QLabel):
         return ""
 
     def mousePressEvent(self, event):
+        crop_action = self.crop_action_at(event.position())
+        if crop_action:
+            self.crop_drag_action = crop_action
+            self.crop_drag_start_pos = self.display_point_to_source(event.position())
+            self.crop_drag_start_rect = QRect(self.crop_rect)
+            self.cropChangeStarted.emit()
+            self.setCursor(QCursor(self.crop_cursor_for_action(crop_action)))
+            event.accept()
+            return
         action = self.action_at(*self.event_position(event))
         if action:
             self.clicked.emit(action)
@@ -362,6 +580,12 @@ class PreviewLabel(QLabel):
             self.setCursor(QCursor(Qt.ClosedHandCursor))
 
     def mouseMoveEvent(self, event):
+        if self.crop_drag_action:
+            self.crop_rect = self.adjusted_crop_rect(self.display_point_to_source(event.position()))
+            self.cropChanged.emit(self.crop_settings_from_rect(self.crop_rect))
+            self.refresh_scaled_pixmap()
+            event.accept()
+            return
         if self.is_panning:
             delta = event.position() - self.last_pan_pos
             self.pan_offset += delta
@@ -369,10 +593,20 @@ class PreviewLabel(QLabel):
             self.refresh_scaled_pixmap()
             return
         action = self.action_at(*self.event_position(event))
-        self.setCursor(QCursor(Qt.PointingHandCursor if action else Qt.ArrowCursor))
+        crop_action = self.crop_action_at(event.position())
+        if crop_action:
+            cursor = self.crop_cursor_for_action(crop_action)
+        else:
+            cursor = Qt.PointingHandCursor if action else Qt.ArrowCursor
+        self.setCursor(QCursor(cursor))
         self.hovered.emit(action)
 
     def mouseReleaseEvent(self, event):
+        if self.crop_drag_action:
+            self.crop_drag_action = ""
+            self.setCursor(QCursor(Qt.ArrowCursor))
+            event.accept()
+            return
         self.is_panning = False
         self.setCursor(QCursor(Qt.ArrowCursor))
 

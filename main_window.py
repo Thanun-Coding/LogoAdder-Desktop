@@ -33,11 +33,13 @@ import logo_core as core
 from dialogs import apply_app_icon, fit_dialog_to_screen
 from logo_core import (
     ADJUSTMENT_DEFAULTS,
+    DEFAULT_CROP,
     KHMER_POSITIONS,
     MARGIN_MAX,
     OUTPUT_FORMATS,
     POSITION_VALUES,
     PREVIEW_SIZE,
+    apply_photo_crop,
     apply_photo_adjustments,
     build_output_path,
     compose_logo,
@@ -47,6 +49,7 @@ from logo_core import (
     list_images,
     load_config,
     normalize_adjustments,
+    normalize_crop,
     normalize_output_settings,
     normalize_position,
     nearest_quality_preset,
@@ -91,7 +94,6 @@ ADJUSTMENT_SLIDERS = (
     ("warmth", "Warm / Cool", -100, 100),
 )
 
-
 class LogoAdderUltra(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -113,10 +115,13 @@ class LogoAdderUltra(QMainWindow):
         self.is_processing = False
         self.controls_to_disable = []
         self.preview_source_cache = {"path": None, "image": None}
+        self.preview_image_cache = {}
         self.preview_logo_cache = {"path": None, "image": None}
         self.preview_hover_action = ""
         self.preview_nav_hitboxes = {}
         self.photo_adjustments = {}
+        self.photo_crops = {}
+        self.crop_undo_stack = {}
         self.adjustment_dialog = None
         QApplication.instance().installEventFilter(self)
 
@@ -546,6 +551,52 @@ class LogoAdderUltra(QMainWindow):
         self.update_adjustment_status()
         self.on_slider_move()
 
+    def target_crop(self):
+        key = self.current_photo_key()
+        if key:
+            return normalize_crop(self.photo_crops.get(key, DEFAULT_CROP))
+        return DEFAULT_CROP.copy()
+
+    def save_target_crop(self, crop, push_undo=True):
+        crop = normalize_crop(crop)
+        key = self.current_photo_key()
+        if not key:
+            return
+        current = normalize_crop(self.photo_crops.get(key, DEFAULT_CROP))
+        if push_undo and crop != current:
+            self.crop_undo_stack.setdefault(key, []).append(current)
+        if crop == DEFAULT_CROP:
+            self.photo_crops.pop(key, None)
+        else:
+            self.photo_crops[key] = crop
+        self.update_crop_status()
+
+    def begin_crop_change(self):
+        key = self.current_photo_key()
+        if not key:
+            return
+        self.crop_undo_stack.setdefault(key, []).append(normalize_crop(self.photo_crops.get(key, DEFAULT_CROP)))
+
+    def update_crop_from_preview(self, crop):
+        self.save_target_crop(crop, push_undo=False)
+        if hasattr(self, "preview_timer"):
+            self.preview_timer.start(45)
+
+    def undo_crop_change(self):
+        key = self.current_photo_key()
+        if not key:
+            return False
+        stack = self.crop_undo_stack.get(key, [])
+        if not stack:
+            self.update_crop_status("No crop change to undo")
+            return False
+        previous = stack.pop()
+        self.save_target_crop(previous, push_undo=False)
+        self.update_crop_status("Crop undo applied")
+        self.update_editor_preview()
+        self.update_live_preview()
+        return True
+
     def apply_adjustments_to_all(self):
         settings = self.target_adjustments()
         self.config["adjustments"] = settings
@@ -558,30 +609,30 @@ class LogoAdderUltra(QMainWindow):
     def create_adjustment_slider(self, parent_layout, key, label_text, min_val, max_val):
         frame = QFrame()
         frame.setObjectName("inputGroup")
-        frame.setFixedHeight(68)
+        frame.setFixedHeight(60)
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(5)
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(18)
         label = QLabel(label_text)
         label.setObjectName("fieldLabel")
-        label.setFixedHeight(34)
+        label.setFixedHeight(30)
         label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         entry = QLineEdit()
         entry.setObjectName("numberEntry")
         entry.setFocusPolicy(Qt.ClickFocus)
         entry.setAlignment(Qt.AlignCenter)
-        entry.setFixedWidth(62)
-        entry.setFixedHeight(34)
+        entry.setFixedWidth(54)
+        entry.setFixedHeight(30)
         row.addWidget(label)
         row.addStretch(1)
         row.addWidget(entry, 0, Qt.AlignTop)
         slider = FriendlySlider(Qt.Horizontal)
         slider.setRange(min_val, max_val)
         slider.setSingleStep(1)
-        slider.setFixedHeight(26)
+        slider.setFixedHeight(22)
         slider.setFocusPolicy(Qt.StrongFocus)
         slider.setProperty("wheelAdjust", True)
 
@@ -643,6 +694,71 @@ class LogoAdderUltra(QMainWindow):
         self.adjustment_status.setText(shown_text)
         self.adjustment_status.setToolTip(str(text))
 
+    def update_crop_status(self, message=None):
+        if not hasattr(self, "crop_status"):
+            return
+        if message:
+            self.crop_status.setText(message)
+            return
+        crop = self.target_crop()
+        if crop == DEFAULT_CROP:
+            self.crop_status.setText("Crop: full photo")
+        else:
+            self.crop_status.setText(
+                f"Crop L {to_khmer_digits(crop['left'])}% / T {to_khmer_digits(crop['top'])}% / "
+                f"R {to_khmer_digits(crop['right'])}% / B {to_khmer_digits(crop['bottom'])}%"
+            )
+
+    def update_editor_preview(self):
+        if not getattr(self, "editor_preview_canvas", None):
+            return
+        folder_path = self.config.get("folder_path")
+        key = self.current_photo_key()
+        if not folder_path or not key:
+            self.editor_preview_canvas.clear_preview("Select a photo to edit")
+            return
+        photo_path = Path(folder_path) / key
+        try:
+            original = self.load_preview_image(photo_path)
+            display = apply_photo_adjustments(original.copy(), self.effective_adjustments(key))
+            display.thumbnail((900, 620), Image.LANCZOS)
+            self.editor_preview_canvas.set_preview_pixmap(pil_to_pixmap(display))
+            self.editor_preview_canvas.set_crop_editor(True, (0, 0, display.width, display.height), self.photo_crops.get(key, DEFAULT_CROP))
+        except (OSError, ValueError, RuntimeError) as error:
+            self.editor_preview_canvas.clear_preview(f"Preview failed:\n{error}")
+
+    def load_preview_image(self, photo_path):
+        key = str(photo_path)
+        if key in self.preview_image_cache:
+            image = self.preview_image_cache.pop(key)
+            self.preview_image_cache[key] = image
+            self.preview_source_cache = {"path": key, "image": image}
+            return image
+        image = open_rgba_image(photo_path)
+        self.preview_image_cache[key] = image
+        while len(self.preview_image_cache) > 4:
+            self.preview_image_cache.pop(next(iter(self.preview_image_cache)))
+        self.preview_source_cache = {"path": key, "image": image}
+        return image
+
+    def prefetch_neighbor_preview_images(self):
+        folder_path = self.config.get("folder_path")
+        if not folder_path or len(self.image_list) < 2:
+            return
+        folder = Path(folder_path)
+        for offset in (-1, 1):
+            filename = self.image_list[(self.current_preview_index + offset) % len(self.image_list)]
+            path = folder / filename
+            key = str(path)
+            if key in self.preview_image_cache:
+                continue
+            try:
+                self.preview_image_cache[key] = open_rgba_image(path)
+            except (OSError, ValueError, RuntimeError):
+                continue
+            while len(self.preview_image_cache) > 4:
+                self.preview_image_cache.pop(next(iter(self.preview_image_cache)))
+
     def open_adjustment_dialog(self):
         if self.adjustment_dialog and self.adjustment_dialog.isVisible():
             self.adjustment_dialog.raise_()
@@ -655,25 +771,78 @@ class LogoAdderUltra(QMainWindow):
         dialog.setObjectName("materialDialog")
         dialog.setModal(False)
         dialog.setWindowModality(Qt.NonModal)
-        fit_dialog_to_screen(dialog, 420, 720)
+        fit_dialog_to_screen(dialog, 980, 760)
         apply_app_icon(dialog)
 
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(8)
-        title = QLabel("កែរូបភាព")
-        title.setObjectName("dialogTitle")
-        title.setAlignment(Qt.AlignCenter)
-        title.setFocusPolicy(Qt.StrongFocus)
-        layout.addWidget(title)
+        layout = QHBoxLayout(dialog)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(14)
+
+        outer_layout = QVBoxLayout()
+        outer_layout.setSpacing(10)
 
         self.adjustment_status = QLabel("")
-        self.adjustment_status.setObjectName("hintLabel")
+        self.adjustment_status.setObjectName("dialogTitle")
         self.adjustment_status.setAlignment(Qt.AlignCenter)
         self.adjustment_status.setWordWrap(False)
         self.adjustment_status.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.adjustment_status.setTextInteractionFlags(Qt.NoTextInteraction)
-        layout.addWidget(self.adjustment_status)
+        outer_layout.addWidget(self.adjustment_status)
+
+        content_row = QHBoxLayout()
+        content_row.setSpacing(14)
+
+        preview_column = QVBoxLayout()
+        preview_column.setSpacing(8)
+
+        self.editor_preview_canvas = PreviewLabel()
+        self.editor_preview_canvas.setMinimumSize(560, 420)
+        self.editor_preview_canvas.cropChangeStarted.connect(self.begin_crop_change)
+        self.editor_preview_canvas.cropChanged.connect(self.update_crop_from_preview)
+        preview_column.addWidget(self.editor_preview_canvas, 1)
+
+        transform_row = QHBoxLayout()
+        transform_row.setSpacing(10)
+        transform_row.addStretch(1)
+        rotate_left_btn = QPushButton()
+        flip_vertical_btn = QPushButton()
+        flip_horizontal_btn = QPushButton()
+        rotate_left_btn.setIcon(QIcon(str(resource_path("arrows-clockwise.svg"))))
+        flip_vertical_btn.setIcon(QIcon(str(resource_path("flip-vertical.svg"))))
+        flip_horizontal_btn.setIcon(QIcon(str(resource_path("flip-horizontal.svg"))))
+        for button in (rotate_left_btn, flip_vertical_btn, flip_horizontal_btn):
+            button.setIconSize(QSize(22, 22))
+            button.setCursor(Qt.PointingHandCursor)
+            button.setFocusPolicy(Qt.NoFocus)
+            button.setProperty("iconButton", True)
+        rotate_left_btn.setToolTip("Rotate 90° left")
+        flip_vertical_btn.setToolTip("Flip vertical")
+        flip_horizontal_btn.setToolTip("Flip horizontal")
+        rotate_left_btn.clicked.connect(self.rotate_current_left)
+        flip_vertical_btn.clicked.connect(lambda: self.toggle_adjustment_flag("flip_vertical"))
+        flip_horizontal_btn.clicked.connect(lambda: self.toggle_adjustment_flag("flip_horizontal"))
+        transform_row.addWidget(rotate_left_btn)
+        transform_row.addWidget(flip_vertical_btn)
+        transform_row.addWidget(flip_horizontal_btn)
+        transform_row.addStretch(1)
+        preview_column.addLayout(transform_row)
+
+        nav_row = QHBoxLayout()
+        prev_btn = QPushButton("Previous")
+        next_btn = QPushButton("Next")
+        for button in (prev_btn, next_btn):
+            button.setCursor(Qt.PointingHandCursor)
+            button.setFocusPolicy(Qt.NoFocus)
+            button.setProperty("dialogButton", True)
+        prev_btn.clicked.connect(self.prev_photo)
+        next_btn.clicked.connect(self.next_photo)
+        nav_row.addWidget(prev_btn)
+        nav_row.addWidget(next_btn)
+        preview_column.addLayout(nav_row)
+        content_row.addLayout(preview_column, 3)
+
+        controls_column = QVBoxLayout()
+        controls_column.setSpacing(8)
 
         top_action_row = QHBoxLayout()
         top_action_row.addStretch(1)
@@ -694,58 +863,67 @@ class LogoAdderUltra(QMainWindow):
         auto_btn.clicked.connect(self.enable_auto_adjustment)
         top_action_row.addWidget(auto_btn)
         top_action_row.addWidget(reset_btn)
-        layout.addLayout(top_action_row)
+        controls_column.addLayout(top_action_row)
+
+        adjustment_title = QLabel("Adjustments")
+        adjustment_title.setObjectName("fieldLabel")
+        controls_column.addWidget(adjustment_title)
 
         self.adjustment_widgets = {}
         for key, label_text, min_val, max_val in ADJUSTMENT_SLIDERS:
-            self.create_adjustment_slider(layout, key, label_text, min_val, max_val)
+            self.create_adjustment_slider(controls_column, key, label_text, min_val, max_val)
 
-        transform_row = QHBoxLayout()
-        transform_label = QLabel("បង្វិលរូបភាព")
-        transform_label.setObjectName("fieldLabel")
-        rotate_left_btn = QPushButton()
-        flip_vertical_btn = QPushButton()
-        flip_horizontal_btn = QPushButton()
-        rotate_left_btn.setIcon(QIcon(str(resource_path("arrows-clockwise.svg"))))
-        flip_vertical_btn.setIcon(QIcon(str(resource_path("flip-vertical.svg"))))
-        flip_horizontal_btn.setIcon(QIcon(str(resource_path("flip-horizontal.svg"))))
-        for button in (rotate_left_btn, flip_vertical_btn, flip_horizontal_btn):
-            button.setIconSize(QSize(22, 22))
-        rotate_left_btn.setToolTip("Rotate 90° left")
-        flip_vertical_btn.setToolTip("Flip vertical")
-        flip_horizontal_btn.setToolTip("Flip horizontal")
-        for button in (rotate_left_btn, flip_vertical_btn, flip_horizontal_btn):
+        crop_title = QLabel("Freeform Crop")
+        crop_title.setObjectName("fieldLabel")
+        controls_column.addWidget(crop_title)
+        self.crop_status = QLabel("")
+        self.crop_status.setObjectName("hintLabel")
+        self.crop_status.setAlignment(Qt.AlignCenter)
+        self.crop_status.setText("Drag the crop box on the preview. Resize from the handles.")
+        controls_column.addWidget(self.crop_status)
+        crop_action_row = QHBoxLayout()
+        undo_crop_btn = QPushButton("Undo Crop")
+        clear_crop_btn = QPushButton("Reset Crop")
+        for button in (undo_crop_btn, clear_crop_btn):
             button.setCursor(Qt.PointingHandCursor)
             button.setFocusPolicy(Qt.NoFocus)
-            button.setProperty("iconButton", True)
-        rotate_left_btn.clicked.connect(self.rotate_current_left)
-        flip_vertical_btn.clicked.connect(lambda: self.toggle_adjustment_flag("flip_vertical"))
-        flip_horizontal_btn.clicked.connect(lambda: self.toggle_adjustment_flag("flip_horizontal"))
-        transform_row.addWidget(transform_label, 1)
-        transform_row.addWidget(rotate_left_btn)
-        transform_row.addWidget(flip_vertical_btn)
-        transform_row.addWidget(flip_horizontal_btn)
-        layout.addLayout(transform_row)
-        layout.addSpacing(8)
+            button.setProperty("dialogButton", True)
+        undo_crop_btn.setToolTip("Ctrl+Z also undoes the last crop change.")
+        undo_crop_btn.clicked.connect(self.undo_crop_change)
+        clear_crop_btn.clicked.connect(self.clear_current_crop)
+        crop_action_row.addWidget(undo_crop_btn)
+        crop_action_row.addWidget(clear_crop_btn)
 
-        action_row = QHBoxLayout()
+        action_grid = QVBoxLayout()
+        action_grid.setSpacing(10)
+        crop_action_row.setSpacing(10)
+        apply_row = QHBoxLayout()
+        apply_row.setSpacing(10)
         apply_all_btn = QPushButton("Apply to all")
         reset_all_btn = QPushButton("Reset all")
         apply_all_btn.setProperty("variant", "primary")
         reset_all_btn.setProperty("variant", "danger")
-        for button in (apply_all_btn, reset_all_btn):
+        for button in (undo_crop_btn, clear_crop_btn, apply_all_btn, reset_all_btn):
             button.setCursor(Qt.PointingHandCursor)
             button.setFocusPolicy(Qt.NoFocus)
             button.setProperty("dialogButton", True)
             button.setProperty("wideDialogButton", True)
+            button.setMinimumWidth(104)
         apply_all_btn.clicked.connect(self.apply_adjustments_to_all)
         reset_all_btn.clicked.connect(self.reset_all_adjustments)
-        action_row.addWidget(apply_all_btn)
-        action_row.addWidget(reset_all_btn)
-        layout.addLayout(action_row)
+        apply_row.addWidget(apply_all_btn)
+        apply_row.addWidget(reset_all_btn)
+        action_grid.addLayout(crop_action_row)
+        action_grid.addLayout(apply_row)
+        controls_column.addLayout(action_grid)
+        controls_column.addStretch(1)
+        content_row.addLayout(controls_column, 2)
+        outer_layout.addLayout(content_row, 1)
+        layout.addLayout(outer_layout, 1)
 
         self.load_adjustment_dialog_values()
-        dialog.finished.connect(lambda _result: setattr(self, "adjustment_dialog", None))
+        self.update_crop_status()
+        dialog.finished.connect(self.close_adjustment_dialog)
         self.position_adjustment_dialog(dialog)
 
         def clear_text_focus(event):
@@ -756,9 +934,18 @@ class LogoAdderUltra(QMainWindow):
 
         dialog.mousePressEvent = clear_text_focus
         dialog.show()
-        title.setFocus(Qt.OtherFocusReason)
+        self.adjustment_status.setFocus(Qt.OtherFocusReason)
         self.update_adjustment_status()
+        self.update_editor_preview()
+        self.update_live_preview()
         dialog.raise_()
+
+    def close_adjustment_dialog(self, _result=None):
+        self.adjustment_dialog = None
+        if hasattr(self, "editor_preview_canvas"):
+            self.editor_preview_canvas.set_crop_editor(False)
+            self.editor_preview_canvas = None
+        self.update_live_preview()
 
     def position_adjustment_dialog(self, dialog):
         screen = dialog.screen() or QApplication.primaryScreen()
@@ -837,6 +1024,11 @@ class LogoAdderUltra(QMainWindow):
         self.save_target_adjustments(reset)
         self.load_adjustment_dialog_values()
 
+    def clear_current_crop(self):
+        self.save_target_crop(DEFAULT_CROP.copy())
+        self.update_editor_preview()
+        self.update_live_preview()
+
     def reset_all_adjustments(self):
         self.config["adjustments"] = ADJUSTMENT_DEFAULTS.copy()
         self.photo_adjustments.clear()
@@ -873,10 +1065,16 @@ class LogoAdderUltra(QMainWindow):
             self.themed_message_dialog("ឯកសារមិនគាំទ្រ", "ទម្លាក់Folderរូបភាព ឬរូបភាពដើម្បីកែ! ជ្រើសរើស Logo ដោយប្រើប៊ូតុងជ្រើសរើស Logo។")
 
     def handle_preview_key_event(self, event):
+        if event.modifiers() == Qt.ControlModifier and event.key() == Qt.Key_Z:
+            dialog_active = self.adjustment_dialog is not None and self.adjustment_dialog.isVisible()
+            if dialog_active:
+                return self.undo_crop_change()
         if event.modifiers() not in (Qt.NoModifier, Qt.KeypadModifier):
             return False
         focus = QApplication.focusWidget()
-        if isinstance(focus, (QLineEdit, QPlainTextEdit)):
+        dialog_active = self.adjustment_dialog is not None and self.adjustment_dialog.isVisible()
+        focus_in_editor = bool(dialog_active and focus is not None and focus.window() is self.adjustment_dialog)
+        if isinstance(focus, (QLineEdit, QPlainTextEdit)) and not focus_in_editor:
             return False
         if event.key() in (Qt.Key_Left, Qt.Key_A):
             self.prev_photo()
@@ -1225,6 +1423,7 @@ class LogoAdderUltra(QMainWindow):
         if not hasattr(self, "pos_menu") or not hasattr(self, "output_format_menu"):
             return
         self.config.update(self.current_config())
+        self.update_editor_preview()
         if hasattr(self, "preview_timer"):
             self.preview_timer.start(110)
 
@@ -1270,6 +1469,9 @@ class LogoAdderUltra(QMainWindow):
             return
         self.image_list = files
         self.photo_adjustments.clear()
+        self.photo_crops.clear()
+        self.crop_undo_stack.clear()
+        self.preview_image_cache.clear()
         self.config["folder_path"] = str(path)
         self.folder_path_lbl.setText(f"{self.truncate_path(path)} ({to_khmer_digits(len(files))} រូបភាព)")
         self.current_preview_index = 0
@@ -1287,6 +1489,9 @@ class LogoAdderUltra(QMainWindow):
             return
         self.image_list = [path.name for path in image_paths]
         self.photo_adjustments.clear()
+        self.photo_crops.clear()
+        self.crop_undo_stack.clear()
+        self.preview_image_cache.clear()
         parent = image_paths[0].parent
         self.config["folder_path"] = str(parent)
         self.folder_path_lbl.setText(f"{to_khmer_digits(len(self.image_list))} រូបភាពពី {self.truncate_path(parent)}")
@@ -1395,15 +1600,21 @@ class LogoAdderUltra(QMainWindow):
         if self.image_list:
             self.current_preview_index = (self.current_preview_index - 1) % len(self.image_list)
             self.preview_canvas.reset_zoom()
-            self.update_live_preview()
+            self.update_editor_preview()
             self.load_adjustment_dialog_values()
+            self.update_crop_status()
+            self.prefetch_neighbor_preview_images()
+            self.preview_timer.start(30)
 
     def next_photo(self):
         if self.image_list:
             self.current_preview_index = (self.current_preview_index + 1) % len(self.image_list)
             self.preview_canvas.reset_zoom()
-            self.update_live_preview()
+            self.update_editor_preview()
             self.load_adjustment_dialog_values()
+            self.update_crop_status()
+            self.prefetch_neighbor_preview_images()
+            self.preview_timer.start(30)
 
     def truncate_path(self, path, length=46):
         text = str(path)
@@ -1425,10 +1636,10 @@ class LogoAdderUltra(QMainWindow):
         canvas = Image.new("RGBA", PREVIEW_SIZE, THEME["surface"])
         photo_path = Path(folder_path) / self.image_list[self.current_preview_index]
         try:
-            if self.preview_source_cache["path"] != str(photo_path):
-                self.preview_source_cache = {"path": str(photo_path), "image": open_rgba_image(photo_path)}
-            original = self.preview_source_cache["image"]
-            display = apply_photo_adjustments(original.copy(), self.effective_adjustments(self.image_list[self.current_preview_index]))
+            original = self.load_preview_image(photo_path)
+            filename = self.image_list[self.current_preview_index]
+            display = apply_photo_crop(original.copy(), self.photo_crops.get(filename, DEFAULT_CROP))
+            display = apply_photo_adjustments(display, self.effective_adjustments(filename))
             display.thumbnail((PREVIEW_SIZE[0] - 16, PREVIEW_SIZE[1] - 16), Image.LANCZOS)
             preview = display
             if logo_path and Path(logo_path).exists():
@@ -1448,6 +1659,7 @@ class LogoAdderUltra(QMainWindow):
             self.draw_preview_controls(canvas, count_text)
             self.count_label.setText(count_text)
             self.preview_canvas.set_zoom_rect((offset[0], offset[1], preview.width, preview.height))
+            self.preview_canvas.set_crop_editor(False)
         except (OSError, ValueError, RuntimeError) as error:
             self.write_log(f"! Preview failed: {error}")
             self.preview_canvas.clear_preview(f"បញ្ហា Preview Screen:\n{error}")
@@ -1488,6 +1700,7 @@ class LogoAdderUltra(QMainWindow):
             return
         settings = self.current_config()
         settings["photo_adjustments"] = {key: normalize_adjustments(value) for key, value in self.photo_adjustments.items()}
+        settings["photo_crops"] = {key: normalize_crop(value) for key, value in self.photo_crops.items()}
         output_settings = normalize_output_settings(settings.get("output"))
         conflict_count = self.count_output_conflicts(folder, files, output_settings)
         conflict_policy = "rename"
