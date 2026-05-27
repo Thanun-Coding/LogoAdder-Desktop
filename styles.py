@@ -163,6 +163,16 @@ def material_qss():
         font-size: 16px;
         font-weight: 700;
     }}
+    QLabel#previewEditOverlay {{
+        background: rgba(2, 11, 24, 178);
+        border: 1px solid rgba(71, 220, 255, 0.42);
+        border-radius: 20px;
+        color: {THEME["cyan"]};
+        font-family: {TITLE_FONT_STACK};
+        font-size: 22px;
+        font-weight: 400;
+        padding: 22px;
+    }}
     QLabel#sectionLabel {{
         color: {THEME["text"]};
         font-family: {TITLE_FONT_STACK};

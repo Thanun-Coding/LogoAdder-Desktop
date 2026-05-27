@@ -309,6 +309,11 @@ class LogoAdderUltra(QMainWindow):
         self.preview_canvas.left.connect(self.handle_preview_leave)
         preview_layout.addWidget(self.preview_canvas)
         main_layout.addWidget(self.preview_container, 1)
+        self.preview_edit_overlay = QLabel("កំពុងកែរូបភាព...")
+        self.preview_edit_overlay.setObjectName("previewEditOverlay")
+        self.preview_edit_overlay.setAlignment(Qt.AlignCenter)
+        self.preview_edit_overlay.hide()
+        self.preview_edit_overlay.setParent(self.preview_container)
 
         status_row = QHBoxLayout()
         self.status_label = QLabel("លទ្ធផល")
@@ -579,7 +584,9 @@ class LogoAdderUltra(QMainWindow):
 
     def update_crop_from_preview(self, crop):
         self.save_target_crop(crop, push_undo=False)
-        if hasattr(self, "preview_timer"):
+        if self.is_adjustment_editor_open():
+            self.set_main_preview_paused(True)
+        elif hasattr(self, "preview_timer"):
             self.preview_timer.start(45)
 
     def undo_crop_change(self):
@@ -761,6 +768,7 @@ class LogoAdderUltra(QMainWindow):
 
     def open_adjustment_dialog(self):
         if self.adjustment_dialog and self.adjustment_dialog.isVisible():
+            self.set_main_preview_paused(True)
             self.adjustment_dialog.raise_()
             self.adjustment_dialog.activateWindow()
             return
@@ -936,8 +944,8 @@ class LogoAdderUltra(QMainWindow):
         dialog.show()
         self.adjustment_status.setFocus(Qt.OtherFocusReason)
         self.update_adjustment_status()
+        self.set_main_preview_paused(True)
         self.update_editor_preview()
-        self.update_live_preview()
         dialog.raise_()
 
     def close_adjustment_dialog(self, _result=None):
@@ -945,7 +953,26 @@ class LogoAdderUltra(QMainWindow):
         if hasattr(self, "editor_preview_canvas"):
             self.editor_preview_canvas.set_crop_editor(False)
             self.editor_preview_canvas = None
+        self.set_main_preview_paused(False)
         self.update_live_preview()
+
+    def is_adjustment_editor_open(self):
+        return bool(self.adjustment_dialog and self.adjustment_dialog.isVisible())
+
+    def position_main_preview_overlay(self):
+        if not hasattr(self, "preview_edit_overlay"):
+            return
+        self.preview_edit_overlay.setGeometry(self.preview_container.rect())
+        if self.preview_edit_overlay.isVisible():
+            self.preview_edit_overlay.raise_()
+
+    def set_main_preview_paused(self, paused):
+        if not hasattr(self, "preview_edit_overlay"):
+            return
+        self.position_main_preview_overlay()
+        self.preview_edit_overlay.setVisible(bool(paused))
+        if paused:
+            self.preview_edit_overlay.raise_()
 
     def position_adjustment_dialog(self, dialog):
         screen = dialog.screen() or QApplication.primaryScreen()
@@ -1424,8 +1451,14 @@ class LogoAdderUltra(QMainWindow):
             return
         self.config.update(self.current_config())
         self.update_editor_preview()
-        if hasattr(self, "preview_timer"):
+        if self.is_adjustment_editor_open():
+            self.set_main_preview_paused(True)
+        elif hasattr(self, "preview_timer"):
             self.preview_timer.start(110)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.position_main_preview_overlay()
 
     def write_log(self, text):
         self.log_box.appendPlainText(text)
@@ -1604,7 +1637,10 @@ class LogoAdderUltra(QMainWindow):
             self.load_adjustment_dialog_values()
             self.update_crop_status()
             self.prefetch_neighbor_preview_images()
-            self.preview_timer.start(30)
+            if self.is_adjustment_editor_open():
+                self.set_main_preview_paused(True)
+            else:
+                self.preview_timer.start(30)
 
     def next_photo(self):
         if self.image_list:
@@ -1614,7 +1650,10 @@ class LogoAdderUltra(QMainWindow):
             self.load_adjustment_dialog_values()
             self.update_crop_status()
             self.prefetch_neighbor_preview_images()
-            self.preview_timer.start(30)
+            if self.is_adjustment_editor_open():
+                self.set_main_preview_paused(True)
+            else:
+                self.preview_timer.start(30)
 
     def truncate_path(self, path, length=46):
         text = str(path)
@@ -1626,6 +1665,9 @@ class LogoAdderUltra(QMainWindow):
             subprocess.Popen(["explorer", str(path.resolve())])
 
     def update_live_preview(self):
+        if self.is_adjustment_editor_open():
+            self.set_main_preview_paused(True)
+            return
         logo_path = self.config.get("logo_path")
         folder_path = self.config.get("folder_path")
         has_images = bool(self.image_list and folder_path)
